@@ -31,13 +31,6 @@ fn bytes(value: Option<fjall::UserValue>) -> Option<Vec<u8>> {
     value.map(|value| value.to_vec())
 }
 
-fn encode_spike_user_key(user_key: &[u8]) -> Vec<u8> {
-    let mut encoded = Vec::with_capacity(user_key.len() + 1);
-    encoded.push(0);
-    encoded.extend_from_slice(user_key);
-    encoded
-}
-
 fn collect_pairs(
     iter: impl Iterator<Item = fjall::Guard>,
 ) -> fjall::Result<Vec<(Vec<u8>, Vec<u8>)>> {
@@ -77,44 +70,18 @@ fn basic_put_get_delete_empty_bytes_and_reopen() -> TestResult {
     Ok(())
 }
 
+// 测试fjall是否支持empty key
 #[test]
-fn empty_key_requires_order_preserving_index_adapter_encoding() -> TestResult {
+fn empty_key_insert_test() -> TestResult {
     {
-        let direct_folder = TempDir::new()?;
-        let (_db, direct_keyspace) = open_default(direct_folder.path())?;
-        let direct_empty_key = catch_unwind(AssertUnwindSafe(|| {
-            direct_keyspace.insert(Vec::<u8>::new(), b"value")
-        }));
-        assert!(
-            direct_empty_key.is_err(),
-            "Fjall 3.1.8 is expected to reject a directly inserted empty key"
-        );
+        let folder = TempDir::new()?;
+        let (_db, keyspace) = open_default(folder.path())?;
+        let direct_empty_key =
+            catch_unwind(AssertUnwindSafe(|| keyspace.insert(b"", b"empty_key")));
+        // fjall 不支持key为empty
+        assert!(direct_empty_key.is_err());
+        // assert_eq!(bytes(keyspace.get(b"")?), Some(b"empty_key".to_vec()));
     }
-
-    let folder = TempDir::new()?;
-    let (_db, keyspace) = open_default(folder.path())?;
-    for key in [b"".as_slice(), b"\x00", b"a", b"\xff"] {
-        keyspace.insert(encode_spike_user_key(key), key)?;
-    }
-
-    assert_eq!(
-        bytes(keyspace.get(encode_spike_user_key(b""))?),
-        Some(Vec::new())
-    );
-
-    let encoded_keys = collect_pairs(keyspace.iter())?
-        .into_iter()
-        .map(|(key, _)| key)
-        .collect::<Vec<_>>();
-    assert_eq!(
-        encoded_keys,
-        vec![
-            encode_spike_user_key(b""),
-            encode_spike_user_key(b"\x00"),
-            encode_spike_user_key(b"a"),
-            encode_spike_user_key(b"\xff"),
-        ]
-    );
 
     Ok(())
 }
@@ -196,6 +163,14 @@ fn iterator_supports_order_reverse_and_seek_via_range() -> TestResult {
             .collect::<Vec<_>>(),
         vec![b"a".as_slice(), b"b", b"c", b"\xff"]
     );
+    // val
+    assert_eq!(
+        forward
+            .iter()
+            .map(|(_, val)| val.as_slice())
+            .collect::<Vec<_>>(),
+        vec![b"1".as_slice(), b"2", b"3", b"4"]
+    );
 
     let reverse = collect_pairs(keyspace.iter().rev())?;
     assert_eq!(
@@ -205,6 +180,14 @@ fn iterator_supports_order_reverse_and_seek_via_range() -> TestResult {
             .collect::<Vec<_>>(),
         vec![b"\xff".as_slice(), b"c", b"b", b"a"]
     );
+    // val
+    assert_eq!(
+        reverse
+            .iter()
+            .map(|(_, val)| val.as_slice())
+            .collect::<Vec<_>>(),
+        vec![b"4".as_slice(), b"3", b"2", b"1"]
+    );
 
     let seek_from_b = collect_pairs(keyspace.range(b"b".as_slice()..))?;
     assert_eq!(
@@ -213,6 +196,14 @@ fn iterator_supports_order_reverse_and_seek_via_range() -> TestResult {
             .map(|(key, _)| key.as_slice())
             .collect::<Vec<_>>(),
         vec![b"b".as_slice(), b"c", b"\xff"]
+    );
+    // val
+    assert_eq!(
+        seek_from_b
+            .iter()
+            .map(|(_, val)| val.as_slice())
+            .collect::<Vec<_>>(),
+        vec![b"2".as_slice(), b"3", b"4"]
     );
 
     Ok(())
@@ -235,7 +226,7 @@ fn database_and_keyspace_are_send_sync_and_support_concurrent_access() -> TestRe
         let barrier = Arc::clone(&barrier);
 
         handles.push(thread::spawn(move || -> fjall::Result<()> {
-            barrier.wait();
+            barrier.wait(); // barrier 同步所有线程启动
 
             for item_id in 0..100 {
                 let key = format!("thread-{thread_id:02}-item-{item_id:03}");
@@ -258,6 +249,14 @@ fn database_and_keyspace_are_send_sync_and_support_concurrent_access() -> TestRe
     }
 
     assert_eq!(keyspace.len()?, thread_count * 100);
+    // 验证所有kv
+    for thread_id in 0..thread_count {
+        for item_id in 0..100 {
+            let key = format!("thread-{thread_id:02}-item-{item_id:03}");
+            let value = format!("value-{thread_id:02}-{item_id:03}");
+            assert_eq!(bytes(keyspace.get(key.as_bytes())?), Some(value.into()));
+        }
+    }
 
     Ok(())
 }

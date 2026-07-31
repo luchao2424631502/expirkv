@@ -1,4 +1,12 @@
 //! RustKV is an append-only, key-value separated embedded database.
 //!
-//! Stage 0 intentionally contains no public database API. The current code
-//! only validates the selected Fjall version before RustKV modules are built.
+//! The public API is being built incrementally. Database operations are added
+//! only after their supporting components have been implemented and tested.
+
+mod batch;
+mod error;
+mod options;
+
+pub use batch::WriteBatch;
+pub use error::{Error, Result};
+pub use options::{Compression, Options, WriteOptions};
