@@ -6,6 +6,7 @@
 mod batch;
 mod error;
 mod options;
+mod vlog;
 
 pub use batch::WriteBatch;
 pub use error::{Error, Result};
