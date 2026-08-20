@@ -1,0 +1,1 @@
+//! Durable-frontier synchronization barriers.
