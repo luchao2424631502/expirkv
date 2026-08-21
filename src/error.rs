@@ -165,6 +165,24 @@ impl StorageError {
         )
     }
 
+    #[allow(dead_code)] // Stage 2 codecs are connected to production paths in later stages.
+    pub(crate) fn codec_error(
+        kind: StorageErrorKind,
+        operation: Operation,
+        protocol_stage: ProtocolStage,
+        write_outcome: Option<WriteOutcome>,
+        retry_advice: RetryAdvice,
+    ) -> Self {
+        Self::new(
+            kind,
+            operation,
+            protocol_stage,
+            write_outcome,
+            None,
+            retry_advice,
+        )
+    }
+
     fn new(
         kind: StorageErrorKind,
         operation: Operation,
