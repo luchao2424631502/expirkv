@@ -28,6 +28,7 @@ pub enum RetryAdvice {
     DoNotRetry,
 }
 
+// 大致的存储错误
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StorageErrorKind {
     InvalidArgument,
@@ -101,6 +102,7 @@ pub struct DestroyFailureContext {
     pub os_code: Option<i32>,
 }
 
+// 具体的存储错误
 pub struct StorageError {
     pub schema_version: u16,
     pub kind: StorageErrorKind,

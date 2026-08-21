@@ -21,16 +21,21 @@ pub struct Options {
     pub vlog_read_handle_cache_capacity: usize,
 }
 
+// RAII construct
 impl Default for Options {
     fn default() -> Self {
         Self {
             create_if_missing: false,
             error_if_exists: false,
+            // 4MB MemTable
             write_buffer_size: 4 * 1024 * 1024,
             max_open_files: 1000,
+            // 8MB LRU Block
             block_cache_size: 8 * 1024 * 1024,
+            // 4KB Block
             block_size: 4 * 1024,
             block_restart_interval: 16,
+            // 2MB SSTable file
             max_file_size: 2 * 1024 * 1024,
             compression: Compression::NoCompression,
             vlog_read_handle_cache_capacity: 64,
