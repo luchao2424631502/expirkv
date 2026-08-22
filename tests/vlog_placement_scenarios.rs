@@ -997,3 +997,460 @@ fn is_file_header(chunk: &PhysicalChunk) -> Option<VLogFileHeader> {
     (header.database_uuid == database_uuid() && header.file_id == chunk.position.file_id)
         .then_some(header)
 }
+
+// ====================================================================
+// Test 2 (round 2): envelope starts / internal layouts the first pass
+// did not cover — page-tail exact remainders, boundary-exact records,
+// mid-envelope PageEnds, mid-way capacity exhaustion, and a precise
+// multi-file chunk stream.
+// ====================================================================
+
+/// Compact classification of one physical chunk for exact-stream assertions.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ChunkKind {
+    PageHeader(u32),
+    FileHeader,
+    PageEnd(u32),
+    Record(RecordType),
+}
+
+fn chunk_kind(chunk: &PhysicalChunk, geometry: VLogGeometry) -> ChunkKind {
+    if chunk.bytes.len() == PAGE_HEADER_ENCODED_LEN
+        && let Some(header) = PageHeader::decode(&chunk.bytes).ok()
+    {
+        let expected_page_no = (chunk.position.offset / geometry.page_size) as u32;
+        assert_eq!(
+            header.file_id, chunk.position.file_id,
+            "decoded file_id mismatch"
+        );
+        assert_eq!(header.page_no, expected_page_no, "decoded page_no mismatch");
+        return ChunkKind::PageHeader(header.page_no);
+    }
+    if chunk.bytes.len() == FILE_HEADER_ENCODED_LEN
+        && let Some(header) = VLogFileHeader::decode(&chunk.bytes).ok()
+    {
+        assert_eq!(
+            header.database_uuid,
+            database_uuid(),
+            "database UUID mismatch"
+        );
+        assert_eq!(
+            header.file_id, chunk.position.file_id,
+            "file header id mismatch"
+        );
+        return ChunkKind::FileHeader;
+    }
+    match record_type(&chunk.bytes) {
+        Some(RecordType::PageEnd) => ChunkKind::PageEnd(chunk.bytes.len() as u32),
+        Some(other) => ChunkKind::Record(other),
+        None => panic!("unrecognized chunk at {:?}", chunk.position),
+    }
+}
+
+/// N1: envelope from an arbitrary first-page interior position.
+#[test]
+fn envelope_from_first_page_interior_offset_100() {
+    for_each_geometry(|g| {
+        let mut planner = LayoutPlanner::from_position(g, pos(0, 100)).unwrap();
+        let ops = [delete_op(b"x")];
+        let envelope = prepare(&mut planner, 11, &ops).unwrap();
+
+        assert_eq!(envelope.vlog_begin, pos(0, 100));
+        assert_eq!(
+            record_positions(&envelope, RecordType::TxBegin),
+            vec![pos(0, 100)]
+        );
+        assert_eq!(
+            record_positions(&envelope, RecordType::DeleteRecord),
+            vec![pos(0, 171)]
+        );
+        assert_eq!(
+            record_positions(&envelope, RecordType::TxPreparedEnd),
+            vec![pos(0, 225)]
+        );
+        assert_eq!(envelope.vlog_end, pos(0, 336));
+        assert_eq!(planner.position(), envelope.vlog_end);
+        assert_envelope_invariants(&envelope, g, (1, 0, 1, 1));
+    });
+}
+
+/// N2: envelope starting with exactly 43 / 42 / 1 bytes left in the page, on the
+/// first page and on a later page. 43 is legal (a minimal PageEnd); 42 and 1 are
+/// InvalidLayout.
+#[test]
+fn envelope_starting_at_exact_page_tail_remainders() {
+    for_each_geometry(|g| {
+        let p = g.page_size;
+        let ops = [delete_op(b"x")];
+
+        // First page, remaining exactly 43: PageEnd(43) then the records.
+        let start = p - u64::from(PAGE_END_MIN_SIZE);
+        let mut planner = LayoutPlanner::from_position(g, pos(0, start)).unwrap();
+        let envelope = prepare(&mut planner, 12, &ops).unwrap();
+        assert_eq!(envelope.vlog_begin, pos(0, start));
+        assert_eq!(envelope.chunks[0].position, pos(0, start));
+        assert_eq!(envelope.chunks[0].bytes.len(), PAGE_END_MIN_SIZE as usize);
+        assert_eq!(
+            record_type(&envelope.chunks[0].bytes),
+            Some(RecordType::PageEnd)
+        );
+        assert!(is_page_header(&envelope.chunks[1], g).is_some());
+        assert_eq!(
+            record_positions(&envelope, RecordType::TxBegin),
+            vec![pos(0, p + OTHER_PAGE_RECORD_AREA_OFFSET)]
+        );
+        assert_eq!(envelope.vlog_end, pos(0, p + 252));
+        assert_envelope_invariants(&envelope, g, (1, 0, 1, 1));
+
+        // Later page (page 2), remaining exactly 43: same shape.
+        let start = 2 * p - u64::from(PAGE_END_MIN_SIZE);
+        let mut planner = LayoutPlanner::from_position(g, pos(0, start)).unwrap();
+        let envelope = prepare(&mut planner, 13, &ops).unwrap();
+        assert_eq!(envelope.chunks[0].position, pos(0, start));
+        assert_eq!(envelope.chunks[0].bytes.len(), PAGE_END_MIN_SIZE as usize);
+        assert_eq!(
+            record_positions(&envelope, RecordType::TxBegin),
+            vec![pos(0, 2 * p + OTHER_PAGE_RECORD_AREA_OFFSET)]
+        );
+        assert_eq!(envelope.vlog_end, pos(0, 2 * p + 252));
+        assert_envelope_invariants(&envelope, g, (1, 0, 1, 1));
+
+        // Remaining 42 / 1 is an unusable tail: InvalidLayout, planner untouched.
+        for bad in [p - 42, p - 1, 2 * p - 42, 2 * p - 1] {
+            let start = pos(0, bad);
+            let mut planner = LayoutPlanner::from_position(g, start).unwrap();
+            assert_kind(
+                prepare(&mut planner, 14, &ops),
+                StorageErrorKind::InvalidLayout,
+            );
+            assert_eq!(planner.position(), start);
+        }
+    });
+}
+
+/// N3: BEGIN ends exactly at the page boundary — the next record gets a header.
+#[test]
+fn envelope_begin_ends_exactly_at_page_boundary() {
+    for_each_geometry(|g| {
+        let p = g.page_size;
+        let start = p - u64::from(TX_BEGIN_ENCODED_LEN);
+        let mut planner = LayoutPlanner::from_position(g, pos(0, start)).unwrap();
+        let ops = [put_op(b"k", b"v")];
+        let envelope = prepare(&mut planner, 15, &ops).unwrap();
+
+        assert_eq!(envelope.vlog_begin, pos(0, start));
+        assert_eq!(
+            record_positions(&envelope, RecordType::TxBegin),
+            vec![pos(0, start)]
+        );
+        assert_eq!(
+            record_positions(&envelope, RecordType::KvRecord),
+            vec![pos(0, p + OTHER_PAGE_RECORD_AREA_OFFSET)]
+        );
+        assert_eq!(envelope.vlog_end, pos(0, p + 184));
+        assert_eq!(planner.position(), envelope.vlog_end);
+        assert_envelope_invariants(&envelope, g, (1, 1, 0, 1));
+    });
+}
+
+/// N4: BEGIN ends exactly at the file boundary — the next record rolls.
+#[test]
+fn envelope_begin_ends_exactly_at_file_boundary() {
+    for_each_geometry(|g| {
+        let f = g.max_file_size;
+        let start = f - u64::from(TX_BEGIN_ENCODED_LEN);
+        let mut planner = LayoutPlanner::from_position(g, pos(0, start)).unwrap();
+        let ops = [put_op(b"k", b"v")];
+        let envelope = prepare(&mut planner, 16, &ops).unwrap();
+
+        assert_eq!(envelope.vlog_begin, pos(0, start));
+        assert_eq!(
+            record_positions(&envelope, RecordType::TxBegin),
+            vec![pos(0, start)]
+        );
+        assert_eq!(
+            record_positions(&envelope, RecordType::KvRecord),
+            vec![pos(1, FIRST_PAGE_RECORD_AREA_START)]
+        );
+        assert_eq!(envelope.vlog_end, pos(1, 232));
+        assert_eq!(planner.position(), envelope.vlog_end);
+        assert_envelope_invariants(&envelope, g, (1, 1, 0, 1));
+    });
+}
+
+/// N5: a PageEnd fired between two operations (after the Delete, before the
+/// second Put).
+#[test]
+fn envelope_page_end_between_operations() {
+    for_each_geometry(|g| {
+        let p = g.page_size;
+        let start = p - 228;
+        let mut planner = LayoutPlanner::from_position(g, pos(0, start)).unwrap();
+        let ops = [put_op(b"k", b"v"), delete_op(b"x"), put_op(b"l", b"w")];
+        let envelope = prepare(&mut planner, 17, &ops).unwrap();
+
+        assert_eq!(envelope.vlog_begin, pos(0, start));
+        assert_eq!(
+            record_positions(&envelope, RecordType::TxBegin),
+            vec![pos(0, start)]
+        );
+        assert_eq!(
+            record_positions(&envelope, RecordType::KvRecord),
+            vec![
+                pos(0, start + 71),
+                pos(0, p + OTHER_PAGE_RECORD_AREA_OFFSET)
+            ]
+        );
+        assert_eq!(
+            record_positions(&envelope, RecordType::DeleteRecord),
+            vec![pos(0, start + 128)]
+        );
+        // The single PageEnd sits between the Delete and the second Put.
+        let page_end_index = envelope
+            .chunks
+            .iter()
+            .position(|chunk| record_type(&chunk.bytes) == Some(RecordType::PageEnd))
+            .unwrap();
+        assert_eq!(envelope.chunks[page_end_index].position, pos(0, p - 46));
+        assert_eq!(envelope.chunks[page_end_index].bytes.len(), 46);
+        assert_eq!(envelope.vlog_end, pos(0, p + 184));
+        assert_eq!(planner.position(), envelope.vlog_end);
+        assert_envelope_invariants(&envelope, g, (3, 2, 1, 3));
+    });
+}
+
+/// N6: a PageEnd fired right before the footer.
+#[test]
+fn envelope_page_end_before_footer() {
+    for_each_geometry(|g| {
+        let p = g.page_size;
+        let start = p - 225;
+        let mut planner = LayoutPlanner::from_position(g, pos(0, start)).unwrap();
+        let ops = [delete_op(b"x")];
+        let envelope = prepare(&mut planner, 18, &ops).unwrap();
+
+        assert_eq!(envelope.vlog_begin, pos(0, start));
+        assert_eq!(
+            record_positions(&envelope, RecordType::TxBegin),
+            vec![pos(0, start)]
+        );
+        assert_eq!(
+            record_positions(&envelope, RecordType::DeleteRecord),
+            vec![pos(0, start + 71)]
+        );
+        let page_end_index = envelope
+            .chunks
+            .iter()
+            .position(|chunk| record_type(&chunk.bytes) == Some(RecordType::PageEnd))
+            .unwrap();
+        assert_eq!(envelope.chunks[page_end_index].position, pos(0, p - 100));
+        assert_eq!(envelope.chunks[page_end_index].bytes.len(), 100);
+        assert_eq!(
+            record_positions(&envelope, RecordType::TxPreparedEnd),
+            vec![pos(0, p + OTHER_PAGE_RECORD_AREA_OFFSET)]
+        );
+        assert_eq!(envelope.vlog_end, pos(0, p + 127));
+        assert_eq!(planner.position(), envelope.vlog_end);
+        assert_envelope_invariants(&envelope, g, (1, 0, 1, 1));
+    });
+}
+
+/// N7: the footer ends exactly at the page boundary.
+#[test]
+fn envelope_footer_ends_exactly_at_page_boundary() {
+    for_each_geometry(|g| {
+        let p = g.page_size;
+        let start = p - 236;
+        let mut planner = LayoutPlanner::from_position(g, pos(0, start)).unwrap();
+        let ops = [delete_op(b"x")];
+        let envelope = prepare(&mut planner, 19, &ops).unwrap();
+
+        assert_eq!(envelope.vlog_begin, pos(0, start));
+        assert_eq!(
+            record_positions(&envelope, RecordType::TxPreparedEnd),
+            vec![pos(0, start + 125)]
+        );
+        assert_eq!(envelope.vlog_end, pos(0, p));
+        assert!(
+            envelope
+                .chunks
+                .iter()
+                .all(|chunk| record_type(&chunk.bytes) != Some(RecordType::PageEnd))
+        );
+        assert_eq!(planner.position(), envelope.vlog_end);
+        assert_envelope_invariants(&envelope, g, (1, 0, 1, 1));
+    });
+}
+
+/// N8: the footer ends exactly at the file boundary.
+#[test]
+fn envelope_footer_ends_exactly_at_file_boundary() {
+    for_each_geometry(|g| {
+        let f = g.max_file_size;
+        let start = f - 236;
+        let mut planner = LayoutPlanner::from_position(g, pos(0, start)).unwrap();
+        let ops = [delete_op(b"x")];
+        let envelope = prepare(&mut planner, 20, &ops).unwrap();
+
+        assert_eq!(envelope.vlog_begin, pos(0, start));
+        assert_eq!(
+            record_positions(&envelope, RecordType::TxPreparedEnd),
+            vec![pos(0, start + 125)]
+        );
+        assert_eq!(envelope.vlog_end, pos(0, f));
+        assert_eq!(planner.position(), envelope.vlog_end);
+        assert_envelope_invariants(&envelope, g, (1, 0, 1, 1));
+    });
+}
+
+/// N9: an envelope starting inside the last file exhausts capacity mid-way.
+#[test]
+fn envelope_exhausts_capacity_mid_way_in_last_file() {
+    for_each_geometry(|g| {
+        let (f, m) = (g.max_file_size, g.max_file_id);
+        let start = pos(m, f - 339);
+        let prefix_ops = [put_op(b"k", b"v"), put_op(b"l", b"w")];
+        let mut prefix_planner = LayoutPlanner::from_position(g, start).unwrap();
+        let prefix = prepare(&mut prefix_planner, 21, &prefix_ops).unwrap();
+        assert_eq!(prefix.vlog_begin, start);
+        assert_eq!(prefix.vlog_end, pos(m, f - u64::from(PAGE_END_MIN_SIZE)));
+        assert_eq!(prefix_planner.position(), prefix.vlog_end);
+        assert_envelope_invariants(&prefix, g, (2, 2, 0, 2));
+
+        let mut planner = LayoutPlanner::from_position(g, start).unwrap();
+        let value = [0xab; 144];
+        let ops = [put_op(b"k", b"v"), put_op(b"l", b"w"), put_op(b"m", &value)];
+        assert_kind(
+            prepare(&mut planner, 21, &ops),
+            StorageErrorKind::CapacityExceeded,
+        );
+        assert_eq!(planner.position(), start);
+    });
+}
+
+/// N10: a precise multi-file envelope. Pinned to geometry (512, 2048, 2) with
+/// eight 496-byte Puts (value 440, one-byte keys) that each exactly fill a later
+/// page, crossing file 0 -> 1 -> 2. Asserts the full 28-chunk stream with exact
+/// positions, page numbers and page-end lengths.
+#[test]
+fn envelope_crossing_three_files_with_exact_chunks() {
+    let geometry = VLogGeometry::test_only(512, 2_048, 2).unwrap();
+    let n = 8;
+    let value_len = (geometry.page_size - 72) as usize;
+
+    let keys: Vec<Vec<u8>> = (0..n).map(|i| vec![b'a' + i as u8]).collect();
+    let values: Vec<Vec<u8>> = (0..n).map(|_| vec![0x5a; value_len]).collect();
+    let ops: Vec<LogicalOperationRef<'_>> = keys
+        .iter()
+        .zip(values.iter())
+        .map(|(key, value)| put_op(key, value))
+        .collect();
+
+    let mut planner = LayoutPlanner::empty(geometry).unwrap();
+    let envelope = prepare(&mut planner, 22, &ops).unwrap();
+
+    let expected: Vec<(VLogPosition, ChunkKind)> = vec![
+        (pos(0, 0), ChunkKind::PageHeader(0)),
+        (pos(0, 16), ChunkKind::FileHeader),
+        (pos(0, 64), ChunkKind::Record(RecordType::TxBegin)),
+        (pos(0, 135), ChunkKind::PageEnd(377)),
+        (pos(0, 512), ChunkKind::PageHeader(1)),
+        (pos(0, 528), ChunkKind::Record(RecordType::KvRecord)),
+        (pos(0, 1024), ChunkKind::PageHeader(2)),
+        (pos(0, 1040), ChunkKind::Record(RecordType::KvRecord)),
+        (pos(0, 1536), ChunkKind::PageHeader(3)),
+        (pos(0, 1552), ChunkKind::Record(RecordType::KvRecord)),
+        (pos(1, 0), ChunkKind::PageHeader(0)),
+        (pos(1, 16), ChunkKind::FileHeader),
+        (pos(1, 64), ChunkKind::PageEnd(448)),
+        (pos(1, 512), ChunkKind::PageHeader(1)),
+        (pos(1, 528), ChunkKind::Record(RecordType::KvRecord)),
+        (pos(1, 1024), ChunkKind::PageHeader(2)),
+        (pos(1, 1040), ChunkKind::Record(RecordType::KvRecord)),
+        (pos(1, 1536), ChunkKind::PageHeader(3)),
+        (pos(1, 1552), ChunkKind::Record(RecordType::KvRecord)),
+        (pos(2, 0), ChunkKind::PageHeader(0)),
+        (pos(2, 16), ChunkKind::FileHeader),
+        (pos(2, 64), ChunkKind::PageEnd(448)),
+        (pos(2, 512), ChunkKind::PageHeader(1)),
+        (pos(2, 528), ChunkKind::Record(RecordType::KvRecord)),
+        (pos(2, 1024), ChunkKind::PageHeader(2)),
+        (pos(2, 1040), ChunkKind::Record(RecordType::KvRecord)),
+        (pos(2, 1536), ChunkKind::PageHeader(3)),
+        (pos(2, 1552), ChunkKind::Record(RecordType::TxPreparedEnd)),
+    ];
+    let actual: Vec<(VLogPosition, ChunkKind)> = envelope
+        .chunks
+        .iter()
+        .map(|chunk| (chunk.position, chunk_kind(chunk, geometry)))
+        .collect();
+    assert_eq!(actual, expected);
+
+    let mut kv_index = 0_usize;
+    let mut saw_begin = false;
+    let mut saw_footer = false;
+    for chunk in &envelope.chunks {
+        let Some(record_type) = record_type(&chunk.bytes) else {
+            continue;
+        };
+        let header = RecordHeader::decode(&chunk.bytes).unwrap();
+        assert_eq!(header.commit_seq, 22);
+        assert_eq!(header.tx_uuid, tx_uuid());
+        match decode_record_at(&chunk.bytes, chunk.position, geometry).unwrap() {
+            DecodedRecord::TxBegin(begin) => {
+                assert!(!saw_begin);
+                saw_begin = true;
+                assert_eq!(record_type, RecordType::TxBegin);
+                assert_eq!(begin.commit_seq, 22);
+                assert_eq!(begin.tx_uuid, tx_uuid());
+                assert_eq!(begin.vlog_begin, pos(0, 0));
+                assert_eq!(begin.logical_op_count, 8);
+                assert_eq!(begin.distinct_key_count, 8);
+            }
+            DecodedRecord::KvRecord(record) => {
+                assert_eq!(record_type, RecordType::KvRecord);
+                assert!(kv_index < n);
+                assert_eq!(record.commit_seq, 22);
+                assert_eq!(record.tx_uuid, tx_uuid());
+                assert_eq!(record.op_index, kv_index as u64);
+                assert_eq!(record.key, keys[kv_index].as_slice());
+                assert_eq!(record.value, values[kv_index].as_slice());
+
+                let pointer = envelope.value_pointers[kv_index].as_ref().unwrap();
+                assert_eq!(pointer.format_version, VALUE_POINTER_FORMAT_VERSION);
+                assert_eq!(pointer.file_id, chunk.position.file_id);
+                assert_eq!(u64::from(pointer.record_offset), chunk.position.offset);
+                assert_eq!(pointer.record_len as usize, chunk.bytes.len());
+                assert_eq!(usize::from(pointer.value_len), values[kv_index].len());
+                kv_index += 1;
+            }
+            DecodedRecord::TxPreparedEnd(footer) => {
+                assert!(!saw_footer);
+                saw_footer = true;
+                assert_eq!(record_type, RecordType::TxPreparedEnd);
+                assert_eq!(footer.commit_seq, 22);
+                assert_eq!(footer.tx_uuid, tx_uuid());
+                assert_eq!(footer.vlog_begin, pos(0, 0));
+                assert_eq!(footer.vlog_end, pos(2, 1663));
+                assert_eq!(footer.logical_op_count, 8);
+                assert_eq!(footer.distinct_key_count, 8);
+                assert_eq!(footer.kv_record_count, 8);
+                assert_eq!(footer.delete_record_count, 0);
+                assert_eq!(footer.envelope_crc32c, envelope.envelope_crc32c);
+            }
+            DecodedRecord::PageEnd => {
+                assert_eq!(record_type, RecordType::PageEnd);
+            }
+            DecodedRecord::DeleteRecord(_) => panic!("unexpected DELETE_RECORD"),
+        }
+    }
+    assert!(saw_begin);
+    assert!(saw_footer);
+    assert_eq!(kv_index, n);
+    assert_eq!(envelope.value_pointers.len(), n);
+
+    assert_eq!(envelope.vlog_begin, pos(0, 0));
+    assert_eq!(envelope.vlog_end, pos(2, 1663));
+    assert_eq!(planner.position(), envelope.vlog_end);
+    assert_envelope_invariants(&envelope, geometry, (8, 8, 0, 8));
+}
