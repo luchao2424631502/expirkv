@@ -1,6 +1,7 @@
 //! Database, read, and write options.
 
 use crate::Snapshot;
+use crate::index::{FjallIndexOptions, IndexCompression};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Compression {
@@ -39,6 +40,24 @@ impl Default for Options {
             max_file_size: 2 * 1024 * 1024,
             compression: Compression::NoCompression,
             vlog_read_handle_cache_capacity: 64,
+        }
+    }
+}
+
+impl Options {
+    #[allow(dead_code)] // Stage 5 mapping; Db::open consumes it in a later skeleton stage.
+    pub(crate) fn fjall_index_options(&self) -> FjallIndexOptions {
+        FjallIndexOptions {
+            write_buffer_size: self.write_buffer_size,
+            max_open_files: self.max_open_files,
+            block_cache_size: self.block_cache_size,
+            block_size: self.block_size,
+            block_restart_interval: self.block_restart_interval,
+            max_file_size: self.max_file_size,
+            compression: match self.compression {
+                Compression::NoCompression => IndexCompression::None,
+                Compression::Lz4 => IndexCompression::Lz4,
+            },
         }
     }
 }

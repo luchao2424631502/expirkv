@@ -15,6 +15,24 @@ const HEAD_SEQ_ENCODED_LEN: usize = 8;
 const DURABLE_FRONTIER_ENCODED_LEN: usize = 31;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IndexCompression {
+    None,
+    Lz4,
+}
+
+/// Backend-only projection of the frozen public index options.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FjallIndexOptions {
+    pub(crate) write_buffer_size: usize,
+    pub(crate) max_open_files: usize,
+    pub(crate) block_cache_size: usize,
+    pub(crate) block_size: usize,
+    pub(crate) block_restart_interval: usize,
+    pub(crate) max_file_size: usize,
+    pub(crate) compression: IndexCompression,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InternalIndexSpace {
     Transaction,
     System,
@@ -166,6 +184,10 @@ impl IndexAtomicBatch {
         &self.operations
     }
 
+    pub(crate) fn into_operations(self) -> Vec<IndexMutation> {
+        self.operations
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.operations.len()
     }
@@ -176,6 +198,11 @@ impl IndexAtomicBatch {
 
     pub(crate) fn is_database_initialization(&self) -> bool {
         is_initialization_triple(&self.operations)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_operations_unchecked_for_test(operations: Vec<IndexMutation>) -> Self {
+        Self { operations }
     }
 
     /// Mandatory preflight for every backend implementation. It runs before the
@@ -412,3 +439,11 @@ pub(crate) trait IndexBackend: Send + Sync {
 }
 
 mod fjall;
+
+pub(crate) type FjallBackend = fjall::FjallBackend;
+#[cfg(test)]
+#[allow(unused_imports)]
+// Included source modules expose only the helpers each test crate uses.
+pub(crate) use fjall::{
+    TestCommitFailure, TestCompression, TestFjallError, TestUserKeyspaceConfiguration,
+};
