@@ -1,6 +1,6 @@
 //! Value Log storage and format implementation.
 
-mod file_set;
+pub(crate) mod file_set;
 pub(crate) mod format;
-mod reader;
-mod writer;
+pub(crate) mod reader;
+pub(crate) mod writer;
