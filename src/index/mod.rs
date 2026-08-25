@@ -3,16 +3,106 @@
 
 use crc32c::crc32c;
 
-use crate::{Result, StorageErrorKind};
+use crate::{Operation, ProtocolStage, Result, RetryAdvice, StorageError, StorageErrorKind};
 
-const DATABASE_IDENTITY_KEY: &[u8] = b"database_identity";
-const HEAD_SEQ_KEY: &[u8] = b"head_seq";
-const DURABLE_FRONTIER_KEY: &[u8] = b"durable_frontier";
+pub(crate) const DATABASE_IDENTITY_KEY: &[u8] = b"database_identity";
+pub(crate) const HEAD_SEQ_KEY: &[u8] = b"head_seq";
+pub(crate) const DURABLE_FRONTIER_KEY: &[u8] = b"durable_frontier";
 const DATABASE_IDENTITY_MAGIC: &[u8; 4] = b"RKDI";
 const DURABLE_FRONTIER_MAGIC: &[u8; 4] = b"RKDF";
 const DATABASE_IDENTITY_ENCODED_LEN: usize = 32;
 const HEAD_SEQ_ENCODED_LEN: usize = 8;
 const DURABLE_FRONTIER_ENCODED_LEN: usize = 31;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DatabaseIdentityV0 {
+    pub(crate) identity_format_version: u16,
+    pub(crate) database_format_version: u32,
+    pub(crate) database_uuid: [u8; 16],
+    pub(crate) keyspace_layout_version: u16,
+}
+
+impl DatabaseIdentityV0 {
+    pub(crate) fn decode(encoded: &[u8]) -> Result<Self> {
+        if encoded.len() != DATABASE_IDENTITY_ENCODED_LEN
+            || encoded.get(0..4) != Some(DATABASE_IDENTITY_MAGIC.as_slice())
+            || !has_valid_trailing_crc(encoded, 28)
+        {
+            return Err(metadata_error(StorageErrorKind::Corruption));
+        }
+        let identity_format_version = u16::from_le_bytes(
+            encoded[4..6]
+                .try_into()
+                .map_err(|_| metadata_error(StorageErrorKind::Corruption))?,
+        );
+        let database_format_version = u32::from_le_bytes(
+            encoded[6..10]
+                .try_into()
+                .map_err(|_| metadata_error(StorageErrorKind::Corruption))?,
+        );
+        let database_uuid = encoded[10..26]
+            .try_into()
+            .map_err(|_| metadata_error(StorageErrorKind::Corruption))?;
+        let keyspace_layout_version = u16::from_le_bytes(
+            encoded[26..28]
+                .try_into()
+                .map_err(|_| metadata_error(StorageErrorKind::Corruption))?,
+        );
+        if identity_format_version != 0 || keyspace_layout_version != 0 {
+            return Err(metadata_error(StorageErrorKind::IncompatibleFormat));
+        }
+        if database_uuid == [0; 16] {
+            return Err(metadata_error(StorageErrorKind::Corruption));
+        }
+        Ok(Self {
+            identity_format_version,
+            database_format_version,
+            database_uuid,
+            keyspace_layout_version,
+        })
+    }
+
+    pub(crate) fn validate_against(
+        &self,
+        database_format_version: u32,
+        database_uuid: [u8; 16],
+    ) -> Result<()> {
+        if self.database_format_version != database_format_version
+            || self.database_uuid != database_uuid
+        {
+            return Err(metadata_error(StorageErrorKind::InvalidLayout));
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn initialization_batch(
+    database_format_version: u32,
+    database_uuid: [u8; 16],
+) -> std::result::Result<IndexAtomicBatch, InternalIndexError> {
+    if database_format_version != 0 || database_uuid == [0; 16] {
+        return Err(InternalIndexError::invalid_batch());
+    }
+
+    let mut identity = [0_u8; DATABASE_IDENTITY_ENCODED_LEN];
+    identity[0..4].copy_from_slice(DATABASE_IDENTITY_MAGIC);
+    identity[6..10].copy_from_slice(&database_format_version.to_le_bytes());
+    identity[10..26].copy_from_slice(&database_uuid);
+    let identity_crc = crc32c(&identity[0..28]);
+    identity[28..32].copy_from_slice(&identity_crc.to_le_bytes());
+
+    let head_seq = [0_u8; HEAD_SEQ_ENCODED_LEN];
+    let mut frontier = [0_u8; DURABLE_FRONTIER_ENCODED_LEN];
+    frontier[0..4].copy_from_slice(DURABLE_FRONTIER_MAGIC);
+    let frontier_crc = crc32c(&frontier[0..27]);
+    frontier[27..31].copy_from_slice(&frontier_crc.to_le_bytes());
+
+    IndexAtomicBatch::initialize_database(
+        try_copy_fixed(&identity)?,
+        try_copy_fixed(&head_seq)?,
+        try_copy_fixed(&frontier)?,
+    )
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum IndexCompression {
@@ -292,6 +382,15 @@ fn try_copy_static_key(key: &[u8]) -> InternalIndexResult<Vec<u8>> {
     Ok(owned)
 }
 
+fn try_copy_fixed<const N: usize>(bytes: &[u8; N]) -> InternalIndexResult<Vec<u8>> {
+    let mut owned = Vec::new();
+    owned
+        .try_reserve_exact(N)
+        .map_err(|_| InternalIndexError::resource_exhausted())?;
+    owned.extend_from_slice(bytes);
+    Ok(owned)
+}
+
 fn is_initialization_triple(operations: &[IndexMutation]) -> bool {
     match operations {
         [
@@ -328,11 +427,11 @@ fn is_valid_initial_database_identity(encoded: &[u8]) -> bool {
         && has_valid_trailing_crc(encoded, 28)
 }
 
-fn is_encoded_head_seq_zero(encoded: &[u8]) -> bool {
+pub(crate) fn is_encoded_head_seq_zero(encoded: &[u8]) -> bool {
     encoded.len() == HEAD_SEQ_ENCODED_LEN && encoded == [0_u8; HEAD_SEQ_ENCODED_LEN]
 }
 
-fn is_encoded_empty_durable_frontier(encoded: &[u8]) -> bool {
+pub(crate) fn is_encoded_empty_durable_frontier(encoded: &[u8]) -> bool {
     encoded.len() == DURABLE_FRONTIER_ENCODED_LEN
         && encoded.get(0..4) == Some(DURABLE_FRONTIER_MAGIC.as_slice())
         && encoded.get(4..27) == Some([0_u8; 23].as_slice())
@@ -354,6 +453,23 @@ fn has_valid_trailing_crc(encoded: &[u8], crc_offset: usize) -> bool {
 
 fn invalid_commit_batch() -> IndexCommitError {
     IndexCommitError::not_applied(InternalIndexError::invalid_batch())
+}
+
+fn metadata_error(kind: StorageErrorKind) -> StorageError {
+    let retry_advice = match kind {
+        StorageErrorKind::IncompatibleFormat => RetryAdvice::DoNotRetry,
+        StorageErrorKind::InvalidLayout | StorageErrorKind::Corruption => {
+            RetryAdvice::RestoreOrRepair
+        }
+        _ => RetryAdvice::DoNotRetry,
+    };
+    StorageError::codec_error(
+        kind,
+        Operation::Open,
+        ProtocolStage::Recovery,
+        None,
+        retry_advice,
+    )
 }
 
 /// Owned key/value pair returned by both user and internal iterators.

@@ -1,13 +1,573 @@
 //! Database lifecycle, public API implementation, and component assembly.
+#![allow(dead_code)] // Stage 7 Open preparation; public assembly is added later.
 
-use std::path::Path;
+use std::fs::File;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::format::{
+    FORMAT_ENCODED_LEN, FORMAT_FILE_NAME, FORMAT_TEMP_FILE_NAME, FormatMetadataV0,
+};
+#[cfg(test)]
+use crate::index::TestCommitFailure;
+use crate::index::{
+    DATABASE_IDENTITY_KEY, DURABLE_FRONTIER_KEY, DatabaseIdentityV0, FjallBackend, HEAD_SEQ_KEY,
+    IndexApplyState, IndexBackend, IndexCommitError, IndexCommitMode, InternalIndexError,
+    InternalIndexSpace, InternalKeyRange, initialization_batch, is_encoded_empty_durable_frontier,
+    is_encoded_head_seq_zero,
+};
+use crate::lock::{
+    ManagedEntryKind, RootLock, invalid_argument_error, layout_error, not_found_error,
+    open_io_error, sync_directory_tree_nofollow, sync_file_data,
+};
 use crate::stats::StatsState;
 use crate::{
     DbIterator, DbStats, InstanceState, KeyRange, Operation, Options, ProtocolStage, RangeCursor,
-    ReadOptions, Result, Snapshot, StorageError, WriteBatch, WriteOptions,
+    ReadOptions, Result, RetryAdvice, Snapshot, StorageError, StorageErrorKind, WriteBatch,
+    WriteOptions,
 };
+
+const INDEX_DIRECTORY_NAME: &str = "index";
+const VLOG_DIRECTORY_NAME: &str = "vlog";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct VLogInventoryEntry {
+    pub(crate) file_id: u32,
+    pub(crate) len: u64,
+    pub(crate) path: PathBuf,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ManagedInventory {
+    pub(crate) vlog_files: Vec<VLogInventoryEntry>,
+}
+
+pub(crate) struct OpenPreparation {
+    // Fields are declared in dependency drop order. The root lock is last so
+    // Fjall and every owned preparation artifact are released before LOCK.
+    index: FjallBackend,
+    inventory: ManagedInventory,
+    format: FormatMetadataV0,
+    root_lock: RootLock,
+}
+
+impl OpenPreparation {
+    pub(crate) fn root_lock(&self) -> &RootLock {
+        &self.root_lock
+    }
+
+    pub(crate) fn format(&self) -> &FormatMetadataV0 {
+        &self.format
+    }
+
+    pub(crate) fn inventory(&self) -> &ManagedInventory {
+        &self.inventory
+    }
+
+    pub(crate) fn index(&self) -> &FjallBackend {
+        &self.index
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InitializationFault {
+    None,
+    #[cfg(test)]
+    BeforeCommit,
+    #[cfg(test)]
+    CommitUnknown,
+    #[cfg(test)]
+    AfterCommitBeforeFormat,
+    #[cfg(test)]
+    CrashBeforeCommit,
+    #[cfg(test)]
+    CrashCommitUnknown,
+    #[cfg(test)]
+    CrashAfterCommitBeforeFormat,
+}
+
+#[cfg(test)]
+pub(crate) const INITIALIZATION_CRASH_EXIT_CODE: i32 = 86;
+
+fn read_format(root: &RootLock, temporary: bool) -> Result<Option<FormatMetadataV0>> {
+    let name = if temporary {
+        FORMAT_TEMP_FILE_NAME
+    } else {
+        FORMAT_FILE_NAME
+    };
+    let Some(mut file) = root.open_existing_regular(name)? else {
+        return Ok(None);
+    };
+    let mut encoded = [0_u8; FORMAT_ENCODED_LEN];
+    if let Err(error) = file.read_exact(&mut encoded) {
+        return if error.kind() == io::ErrorKind::UnexpectedEof {
+            Err(metadata_error(StorageErrorKind::Corruption))
+        } else {
+            Err(open_io_error(error))
+        };
+    }
+    let mut trailing = [0_u8; 1];
+    match file.read(&mut trailing) {
+        Ok(0) => FormatMetadataV0::decode(&encoded).map(Some),
+        Ok(_) => Err(metadata_error(StorageErrorKind::Corruption)),
+        Err(error) => Err(open_io_error(error)),
+    }
+}
+
+fn create_synced_format_temp(root: &RootLock, format: &FormatMetadataV0) -> Result<()> {
+    let encoded = format.encode()?;
+    let mut file = root.create_new_regular(FORMAT_TEMP_FILE_NAME)?;
+    file.write_all(&encoded).map_err(open_io_error)?;
+    sync_file_data(&file).map_err(open_io_error)?;
+    root.sync_root()
+}
+
+fn publish_format_temp(root: &RootLock) -> Result<()> {
+    if !matches!(
+        root.inspect_child(FORMAT_FILE_NAME)?,
+        ManagedEntryKind::Missing
+    ) || !matches!(
+        root.inspect_child(FORMAT_TEMP_FILE_NAME)?,
+        ManagedEntryKind::RegularFile { .. }
+    ) {
+        return Err(layout_error());
+    }
+    root.rename_child(FORMAT_TEMP_FILE_NAME, FORMAT_FILE_NAME)?;
+    root.sync_root()
+}
+
+fn generate_database_uuid() -> Result<[u8; 16]> {
+    for _ in 0..4 {
+        let mut source = File::open("/dev/urandom").map_err(open_io_error)?;
+        let mut database_uuid = [0_u8; 16];
+        source
+            .read_exact(&mut database_uuid)
+            .map_err(open_io_error)?;
+        if database_uuid != [0; 16] {
+            return Ok(database_uuid);
+        }
+    }
+    Err(StorageError::codec_error(
+        StorageErrorKind::Unrecoverable,
+        Operation::Open,
+        ProtocolStage::Preflight,
+        None,
+        RetryAdvice::DoNotRetry,
+    ))
+}
+
+pub(crate) fn prepare_open(options: &Options, path: &Path) -> Result<OpenPreparation> {
+    prepare_open_inner(options, path, InitializationFault::None)
+}
+
+#[cfg(test)]
+pub(crate) fn prepare_open_with_fault(
+    options: &Options,
+    path: &Path,
+    fault: InitializationFault,
+) -> Result<OpenPreparation> {
+    prepare_open_inner(options, path, fault)
+}
+
+fn prepare_open_inner(
+    options: &Options,
+    path: &Path,
+    fault: InitializationFault,
+) -> Result<OpenPreparation> {
+    let Some(root_lock) = RootLock::acquire(path, options.create_if_missing)? else {
+        return Err(not_found_error());
+    };
+
+    // The coexistence rule is based only on directory-entry presence. Decode
+    // neither file before enforcing it: even a malformed FORMAT or FORMAT.tmp
+    // must not change the required InvalidLayout classification.
+    let format_present = !matches!(
+        root_lock.inspect_child(FORMAT_FILE_NAME)?,
+        ManagedEntryKind::Missing
+    );
+    let temporary_format_present = !matches!(
+        root_lock.inspect_child(FORMAT_TEMP_FILE_NAME)?,
+        ManagedEntryKind::Missing
+    );
+    if format_present && temporary_format_present {
+        return Err(layout_error());
+    }
+    let format = read_format(&root_lock, false)?;
+    let temporary_format = read_format(&root_lock, true)?;
+
+    match (format, temporary_format) {
+        (Some(_), Some(_)) => Err(layout_error()),
+        (Some(format), None) => prepare_existing(options, root_lock, format),
+        (None, Some(temporary_format)) => {
+            validate_interrupted_initialization(options, &root_lock, &temporary_format)?;
+            if !options.create_if_missing {
+                return Err(not_found_error());
+            }
+            cleanup_interrupted_initialization(&root_lock)?;
+            initialize_database(options, root_lock, fault)
+        }
+        (None, None) => {
+            if !matches!(
+                root_lock.inspect_child(INDEX_DIRECTORY_NAME)?,
+                ManagedEntryKind::Missing
+            ) || !matches!(
+                root_lock.inspect_child(VLOG_DIRECTORY_NAME)?,
+                ManagedEntryKind::Missing
+            ) {
+                return Err(layout_error());
+            }
+            if !options.create_if_missing {
+                return Err(not_found_error());
+            }
+            initialize_database(options, root_lock, fault)
+        }
+    }
+}
+
+fn prepare_existing(
+    options: &Options,
+    root_lock: RootLock,
+    format: FormatMetadataV0,
+) -> Result<OpenPreparation> {
+    let inventory = ManagedInventory::inspect(&root_lock, &format)?;
+    let index_path = root_lock.canonical_path().join(INDEX_DIRECTORY_NAME);
+    let index = FjallBackend::open_existing_for_open_preparation(
+        &index_path,
+        options.fjall_index_options(),
+    )?;
+    validate_final_identity(&index, &format)?;
+    if options.error_if_exists {
+        return Err(invalid_argument_error());
+    }
+    Ok(OpenPreparation {
+        root_lock,
+        format,
+        inventory,
+        index,
+    })
+}
+
+fn initialize_database(
+    options: &Options,
+    root_lock: RootLock,
+    _fault: InitializationFault,
+) -> Result<OpenPreparation> {
+    let format = FormatMetadataV0::new(generate_database_uuid()?)?;
+    create_synced_format_temp(&root_lock, &format)?;
+    root_lock.create_directory(INDEX_DIRECTORY_NAME)?;
+    root_lock.create_directory(VLOG_DIRECTORY_NAME)?;
+    root_lock.sync_root()?;
+
+    let index_path = root_lock.canonical_path().join(INDEX_DIRECTORY_NAME);
+    // 创建Fjall index索引目录
+    let index =
+        FjallBackend::create_for_open_preparation(&index_path, options.fjall_index_options())?;
+
+    #[cfg(test)]
+    match _fault {
+        InitializationFault::BeforeCommit => return Err(initialization_io_error()),
+        InitializationFault::CrashBeforeCommit => {
+            std::process::exit(INITIALIZATION_CRASH_EXIT_CODE)
+        }
+        _ => {}
+    }
+    #[cfg(test)]
+    if matches!(
+        _fault,
+        InitializationFault::CommitUnknown | InitializationFault::CrashCommitUnknown
+    ) {
+        index.set_commit_failure(TestCommitFailure::AfterCommitReturned);
+    }
+
+    let batch = initialization_batch(format.format_version, format.database_uuid)
+        .map_err(index_preflight_error)?;
+    let commit_result = index
+        .commit_atomic(batch, IndexCommitMode::SyncAll)
+        .map_err(initialization_commit_error);
+
+    #[cfg(test)]
+    if _fault == InitializationFault::CrashCommitUnknown {
+        debug_assert!(commit_result.is_err());
+        std::process::exit(INITIALIZATION_CRASH_EXIT_CODE);
+    }
+    commit_result?;
+
+    #[cfg(test)]
+    match _fault {
+        InitializationFault::AfterCommitBeforeFormat => return Err(initialization_io_error()),
+        InitializationFault::CrashAfterCommitBeforeFormat => {
+            std::process::exit(INITIALIZATION_CRASH_EXIT_CODE)
+        }
+        _ => {}
+    }
+
+    sync_directory_tree_nofollow(&index_path)?;
+    root_lock.sync_directory(VLOG_DIRECTORY_NAME)?;
+    root_lock.sync_root()?;
+    if read_format(&root_lock, true)?.as_ref() != Some(&format) {
+        return Err(metadata_error(StorageErrorKind::Corruption));
+    }
+    publish_format_temp(&root_lock)?;
+
+    let inventory = ManagedInventory::inspect(&root_lock, &format)?;
+    validate_final_identity(&index, &format)?;
+    Ok(OpenPreparation {
+        root_lock,
+        format,
+        inventory,
+        index,
+    })
+}
+
+fn validate_final_identity(index: &FjallBackend, format: &FormatMetadataV0) -> Result<()> {
+    let encoded = index
+        .get_database_identity()
+        .map_err(open_recovery_error)?
+        .ok_or_else(|| metadata_error(StorageErrorKind::Corruption))?;
+    DatabaseIdentityV0::decode(&encoded)?
+        .validate_against(format.format_version, format.database_uuid)?;
+    if index
+        .get_internal(InternalIndexSpace::System, HEAD_SEQ_KEY)
+        .map_err(open_recovery_error)?
+        .is_none()
+        || index
+            .get_internal(InternalIndexSpace::System, DURABLE_FRONTIER_KEY)
+            .map_err(open_recovery_error)?
+            .is_none()
+    {
+        return Err(metadata_error(StorageErrorKind::Corruption));
+    }
+    Ok(())
+}
+
+fn validate_interrupted_initialization(
+    options: &Options,
+    root_lock: &RootLock,
+    temporary_format: &FormatMetadataV0,
+) -> Result<()> {
+    match root_lock.inspect_child(VLOG_DIRECTORY_NAME)? {
+        ManagedEntryKind::Missing => {}
+        ManagedEntryKind::Directory => {
+            let mut entries = root_lock.read_directory(VLOG_DIRECTORY_NAME)?;
+            if entries
+                .next()
+                .transpose()
+                .map_err(crate::lock::open_io_error)?
+                .is_some()
+            {
+                return Err(layout_error());
+            }
+        }
+        _ => return Err(layout_error()),
+    }
+
+    match root_lock.inspect_child(INDEX_DIRECTORY_NAME)? {
+        ManagedEntryKind::Missing => Ok(()),
+        ManagedEntryKind::Directory => {
+            let index_path = root_lock.canonical_path().join(INDEX_DIRECTORY_NAME);
+            let mut entries = root_lock.read_directory(INDEX_DIRECTORY_NAME)?;
+            if entries
+                .next()
+                .transpose()
+                .map_err(crate::lock::open_io_error)?
+                .is_none()
+            {
+                return Ok(());
+            }
+            let index = FjallBackend::open_existing_for_open_preparation(
+                &index_path,
+                options.fjall_index_options(),
+            )?;
+            validate_interrupted_index(&index, temporary_format)
+        }
+        _ => Err(layout_error()),
+    }
+}
+
+fn validate_interrupted_index(
+    index: &FjallBackend,
+    temporary_format: &FormatMetadataV0,
+) -> Result<()> {
+    let identity = index.get_database_identity().map_err(open_recovery_error)?;
+    match identity {
+        None => {
+            if backend_is_completely_empty(index)? {
+                Ok(())
+            } else {
+                Err(layout_error())
+            }
+        }
+        Some(encoded_identity) => {
+            DatabaseIdentityV0::decode(&encoded_identity)?.validate_against(
+                temporary_format.format_version,
+                temporary_format.database_uuid,
+            )?;
+            if index
+                .iter_user(None)
+                .map_err(open_recovery_error)?
+                .next()
+                .transpose()
+                .map_err(open_recovery_error)?
+                .is_some()
+                || index
+                    .scan_internal(InternalIndexSpace::Transaction, InternalKeyRange::all())
+                    .map_err(open_recovery_error)?
+                    .next()
+                    .transpose()
+                    .map_err(open_recovery_error)?
+                    .is_some()
+            {
+                return Err(layout_error());
+            }
+
+            let mut found_identity = false;
+            let mut found_head = false;
+            let mut found_frontier = false;
+            let entries = index
+                .scan_internal(InternalIndexSpace::System, InternalKeyRange::all())
+                .map_err(open_recovery_error)?;
+            for entry in entries {
+                let entry = entry.map_err(open_recovery_error)?;
+                match entry.key.as_slice() {
+                    DATABASE_IDENTITY_KEY => {
+                        if found_identity || entry.value != encoded_identity {
+                            return Err(metadata_error(StorageErrorKind::Corruption));
+                        }
+                        found_identity = true;
+                    }
+                    HEAD_SEQ_KEY => {
+                        if found_head || !is_encoded_head_seq_zero(&entry.value) {
+                            return Err(metadata_error(StorageErrorKind::Corruption));
+                        }
+                        found_head = true;
+                    }
+                    DURABLE_FRONTIER_KEY => {
+                        if found_frontier || !is_encoded_empty_durable_frontier(&entry.value) {
+                            return Err(metadata_error(StorageErrorKind::Corruption));
+                        }
+                        found_frontier = true;
+                    }
+                    _ => return Err(layout_error()),
+                }
+            }
+            if found_identity && found_head && found_frontier {
+                Ok(())
+            } else {
+                Err(metadata_error(StorageErrorKind::Corruption))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn validate_interrupted_index_for_test(
+    index: &FjallBackend,
+    temporary_format: &FormatMetadataV0,
+) -> Result<()> {
+    validate_interrupted_index(index, temporary_format)
+}
+
+fn backend_is_completely_empty(index: &FjallBackend) -> Result<bool> {
+    if index
+        .iter_user(None)
+        .map_err(open_recovery_error)?
+        .next()
+        .transpose()
+        .map_err(open_recovery_error)?
+        .is_some()
+    {
+        return Ok(false);
+    }
+    for space in [InternalIndexSpace::Transaction, InternalIndexSpace::System] {
+        if index
+            .scan_internal(space, InternalKeyRange::all())
+            .map_err(open_recovery_error)?
+            .next()
+            .transpose()
+            .map_err(open_recovery_error)?
+            .is_some()
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn cleanup_interrupted_initialization(root_lock: &RootLock) -> Result<()> {
+    root_lock.remove_directory_tree_if_present(INDEX_DIRECTORY_NAME)?;
+    root_lock.remove_directory_tree_if_present(VLOG_DIRECTORY_NAME)?;
+    root_lock.remove_regular_child_if_present(FORMAT_TEMP_FILE_NAME)?;
+    root_lock.sync_root()
+}
+
+fn index_preflight_error(error: InternalIndexError) -> StorageError {
+    let mut storage_error = metadata_error(error.kind);
+    storage_error.protocol_stage = ProtocolStage::Preflight;
+    storage_error.os_code = error.os_code;
+    storage_error
+}
+
+fn initialization_commit_error(error: IndexCommitError) -> StorageError {
+    let retry_advice = if error.apply_state == IndexApplyState::Unknown {
+        RetryAdvice::ReopenAndVerify
+    } else {
+        retry_advice_for(error.source.kind)
+    };
+    let mut storage_error = StorageError::codec_error(
+        error.source.kind,
+        Operation::Open,
+        ProtocolStage::IndexCommit,
+        None,
+        retry_advice,
+    );
+    storage_error.os_code = error.source.os_code;
+    storage_error
+}
+
+fn initialization_io_error() -> StorageError {
+    StorageError::codec_error(
+        StorageErrorKind::Io,
+        Operation::Open,
+        ProtocolStage::IndexCommit,
+        None,
+        RetryAdvice::FixEnvironmentAndReopen,
+    )
+}
+
+fn metadata_error(kind: StorageErrorKind) -> StorageError {
+    StorageError::codec_error(
+        kind,
+        Operation::Open,
+        ProtocolStage::Recovery,
+        None,
+        retry_advice_for(kind),
+    )
+}
+
+fn open_recovery_error(mut error: StorageError) -> StorageError {
+    error.operation = Operation::Open;
+    error.protocol_stage = ProtocolStage::Recovery;
+    error.write_outcome = None;
+    error.instance_state = None;
+    error
+}
+
+fn retry_advice_for(kind: StorageErrorKind) -> RetryAdvice {
+    match kind {
+        StorageErrorKind::InvalidArgument => RetryAdvice::FixRequestAndRetrySameInstance,
+        StorageErrorKind::Busy | StorageErrorKind::ResourceExhausted => {
+            RetryAdvice::RetrySameInstance
+        }
+        StorageErrorKind::Io => RetryAdvice::FixEnvironmentAndReopen,
+        StorageErrorKind::StoragePoisoned => RetryAdvice::ReopenAndVerify,
+        StorageErrorKind::IncompatibleFormat => RetryAdvice::DoNotRetry,
+        StorageErrorKind::Corruption
+        | StorageErrorKind::InvalidLayout
+        | StorageErrorKind::Unrecoverable => RetryAdvice::RestoreOrRepair,
+        _ => RetryAdvice::DoNotRetry,
+    }
+}
 
 pub(crate) struct DbInner {
     stats: StatsState,

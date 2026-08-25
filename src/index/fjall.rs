@@ -50,6 +50,12 @@ struct ValidatedOptions {
     compression: CompressionType,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BackgroundWorkerMode {
+    Enabled,
+    Disabled,
+}
+
 #[derive(Clone)]
 pub(crate) struct FjallSnapshot {
     inner: ::fjall::Snapshot,
@@ -205,7 +211,23 @@ impl FjallBackend {
     pub(crate) fn create(path: &Path, options: FjallIndexOptions) -> Result<Self> {
         let validated = validate_options(options)?;
         validate_create_target(path)?;
-        Self::open(path, validated, false)
+        Self::open(path, validated, false, BackgroundWorkerMode::Enabled)
+    }
+
+    /// Creates the container for the ordered database-open preparation path.
+    ///
+    /// Fjall normally starts its flush/compaction pool from `Database::open`.
+    /// Stage 7 must finish identity validation and recovery before any background
+    /// worker can run, so this entry point deliberately opens Fjall with a
+    /// zero-sized worker pool. Later lifecycle assembly must activate or reopen
+    /// the backend only after the remaining open steps have succeeded.
+    pub(crate) fn create_for_open_preparation(
+        path: &Path,
+        options: FjallIndexOptions,
+    ) -> Result<Self> {
+        let validated = validate_options(options)?;
+        validate_create_target(path)?;
+        Self::open(path, validated, false, BackgroundWorkerMode::Disabled)
     }
 
     /// Opens an existing Fjall database without creating a directory or keyspace.
@@ -216,18 +238,38 @@ impl FjallBackend {
     pub(crate) fn open_existing(path: &Path, options: FjallIndexOptions) -> Result<Self> {
         let validated = validate_options(options)?;
         validate_existing_layout(path)?;
-        Self::open(path, validated, true)
+        Self::open(path, validated, true, BackgroundWorkerMode::Enabled)
     }
 
-    fn open(path: &Path, validated: ValidatedOptions, existing_only: bool) -> Result<Self> {
-        let database = Database::builder(path)
+    /// Opens an existing container without starting Fjall background workers.
+    /// This is restricted to the ordered database-open preparation path.
+    pub(crate) fn open_existing_for_open_preparation(
+        path: &Path,
+        options: FjallIndexOptions,
+    ) -> Result<Self> {
+        let validated = validate_options(options)?;
+        validate_existing_layout(path)?;
+        Self::open(path, validated, true, BackgroundWorkerMode::Disabled)
+    }
+
+    fn open(
+        path: &Path,
+        validated: ValidatedOptions,
+        existing_only: bool,
+        background_worker_mode: BackgroundWorkerMode,
+    ) -> Result<Self> {
+        let mut builder = Database::builder(path)
             .cache_size(validated.block_cache_size)
             .max_cached_files(Some(validated.original.max_open_files))
-            .manual_journal_persist(true)
-            .open()
-            .map_err(|error| {
-                storage_error_from_fjall(error, Operation::Open, ProtocolStage::Preflight)
-            })?;
+            .manual_journal_persist(true);
+        if background_worker_mode == BackgroundWorkerMode::Disabled {
+            // Fjall 3.1.8 exposes this hidden builder hook for zero-worker
+            // recovery/open flows; the checked API intentionally rejects zero.
+            builder = builder.worker_threads_unchecked(0);
+        }
+        let database = builder.open().map_err(|error| {
+            storage_error_from_fjall(error, Operation::Open, ProtocolStage::Preflight)
+        })?;
 
         if existing_only {
             validate_exact_keyspace_names(&database)?;
@@ -363,6 +405,18 @@ impl FjallBackend {
     }
 
     #[cfg(test)]
+    pub(crate) fn rotate_user_memtable_without_wait(&self) -> Result<bool> {
+        self.user.rotate_memtable().map_err(|error| {
+            storage_error_from_fjall(error, Operation::WriteBatch, ProtocolStage::IndexCommit)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn outstanding_flushes(&self) -> usize {
+        self.database.outstanding_flushes()
+    }
+
+    #[cfg(test)]
     pub(crate) fn commit_database_batch_without_durability(
         &self,
         key: &[u8],
@@ -385,6 +439,39 @@ impl FjallBackend {
         let keyspace = space.map_or(&self.user, |space| self.keyspace(space));
         keyspace.insert(key, value).map_err(|error| {
             storage_error_from_fjall(error, Operation::WriteBatch, ProtocolStage::IndexCommit)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn overwrite_database_identity_for_test(
+        &self,
+        encoded_identity: Option<&[u8]>,
+    ) -> Result<()> {
+        let mut batch = OwnedWriteBatch::with_capacity(self.database.clone(), 1)
+            .durability(Some(PersistMode::SyncAll));
+        if let Some(encoded_identity) = encoded_identity {
+            batch.insert(&self.system, DATABASE_IDENTITY_KEY, encoded_identity);
+        } else {
+            batch.remove(&self.system, DATABASE_IDENTITY_KEY);
+        }
+        batch.commit().map_err(|error| {
+            storage_error_from_fjall(error, Operation::Open, ProtocolStage::IndexCommit)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_for_test_sync_all(
+        &self,
+        space: Option<InternalIndexSpace>,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<()> {
+        let keyspace = space.map_or(&self.user, |space| self.keyspace(space));
+        let mut batch = OwnedWriteBatch::with_capacity(self.database.clone(), 1)
+            .durability(Some(PersistMode::SyncAll));
+        batch.insert(keyspace, key, value);
+        batch.commit().map_err(|error| {
+            storage_error_from_fjall(error, Operation::Open, ProtocolStage::IndexCommit)
         })
     }
 

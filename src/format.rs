@@ -1,8 +1,10 @@
 //! Root FORMAT metadata.
-#![allow(dead_code)] // Stage 2 codec; production consumers are wired in later stages.
+#![allow(dead_code)] // Stage 7 Open preparation; public Db wiring is added later.
 
 use crate::{Operation, ProtocolStage, Result, RetryAdvice, StorageError, StorageErrorKind};
 
+pub(crate) const FORMAT_FILE_NAME: &str = "FORMAT";
+pub(crate) const FORMAT_TEMP_FILE_NAME: &str = "FORMAT.tmp";
 pub(crate) const FORMAT_MAGIC: [u8; 8] = *b"RUSTKV00";
 pub(crate) const FORMAT_VERSION: u32 = 0;
 pub(crate) const FORMAT_ENCODED_LEN: usize = 36;
