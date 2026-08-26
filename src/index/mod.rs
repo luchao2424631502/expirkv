@@ -222,6 +222,15 @@ impl IndexAtomicBatch {
         }
     }
 
+    pub(crate) fn try_with_capacity(capacity: usize) -> InternalIndexResult<Self> {
+        inject_index_batch_allocation_failure()?;
+        let mut operations = Vec::new();
+        operations
+            .try_reserve_exact(capacity)
+            .map_err(|_| InternalIndexError::resource_exhausted())?;
+        Ok(Self { operations })
+    }
+
     /// Constructs the only legal batch containing `InitializeDatabaseIdentity`.
     ///
     /// The caller supplies values encoded by the metadata codec. This constructor
@@ -332,6 +341,36 @@ impl Default for IndexAtomicBatch {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[cfg(test)]
+mod index_batch_allocation_failure {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAIL_NEXT: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn inject() {
+        FAIL_NEXT.with(|fail| assert!(!fail.replace(true)));
+    }
+
+    pub(super) fn should_fail() -> bool {
+        FAIL_NEXT.with(|fail| fail.replace(false))
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn inject_index_batch_allocation_failure_for_test() {
+    index_batch_allocation_failure::inject();
+}
+
+fn inject_index_batch_allocation_failure() -> InternalIndexResult<()> {
+    #[cfg(test)]
+    if index_batch_allocation_failure::should_fail() {
+        return Err(InternalIndexError::resource_exhausted());
+    }
+    Ok(())
 }
 
 fn validate_ordinary_mutation(mutation: &IndexMutation) -> InternalIndexResult<()> {

@@ -154,6 +154,30 @@ impl StorageError {
         )
     }
 
+    pub(crate) fn write_preflight(
+        kind: StorageErrorKind,
+        operation: Operation,
+        retry_advice: RetryAdvice,
+    ) -> Self {
+        Self::write_preflight_in_state(kind, operation, InstanceState::Healthy, retry_advice)
+    }
+
+    pub(crate) fn write_preflight_in_state(
+        kind: StorageErrorKind,
+        operation: Operation,
+        instance_state: InstanceState,
+        retry_advice: RetryAdvice,
+    ) -> Self {
+        Self::new(
+            kind,
+            operation,
+            ProtocolStage::Preflight,
+            Some(WriteOutcome::NotCommitted),
+            Some(instance_state),
+            retry_advice,
+        )
+    }
+
     pub(crate) fn invalid_iterator_target(instance_state: InstanceState) -> Self {
         Self::new(
             StorageErrorKind::InvalidArgument,

@@ -283,6 +283,7 @@ pub(crate) fn encode_tx_mutation(mutation: &TxMutation) -> Result<Vec<u8>> {
         .ok_or_else(encode_capacity)?;
 
     let mut encoded = Vec::new();
+    inject_descriptor_allocation_failure(DescriptorAllocationFailureSite::MutationValue)?;
     encoded
         .try_reserve_exact(encoded_len)
         .map_err(|_| encode_allocation())?;
@@ -341,10 +342,12 @@ pub(crate) fn encode_descriptor(descriptor: &TransactionDescriptor) -> Result<En
     validate_tx_meta(&descriptor.meta, true)?;
 
     let mut seen_keys: HashSet<&[u8]> = HashSet::new();
+    inject_descriptor_allocation_failure(DescriptorAllocationFailureSite::SeenKeys)?;
     seen_keys
         .try_reserve(expected_count)
         .map_err(|_| encode_allocation())?;
     let mut mutations = Vec::new();
+    inject_descriptor_allocation_failure(DescriptorAllocationFailureSite::EncodedMutations)?;
     mutations
         .try_reserve_exact(expected_count)
         .map_err(|_| encode_allocation())?;
@@ -838,6 +841,53 @@ fn read_u64_le(input: &[u8], offset: usize) -> Option<u64> {
 
 fn read_u64_be(input: &[u8], offset: usize) -> Option<u64> {
     Some(u64::from_be_bytes(read_array(input, offset)?))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DescriptorAllocationFailureSite {
+    SeenKeys,
+    EncodedMutations,
+    MutationValue,
+}
+
+#[cfg(test)]
+mod descriptor_allocation_failure {
+    use std::cell::Cell;
+
+    use super::DescriptorAllocationFailureSite;
+
+    thread_local! {
+        static NEXT_FAILURE: Cell<Option<DescriptorAllocationFailureSite>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn inject(site: DescriptorAllocationFailureSite) {
+        NEXT_FAILURE.with(|next| assert!(next.replace(Some(site)).is_none()));
+    }
+
+    pub(super) fn should_fail(site: DescriptorAllocationFailureSite) -> bool {
+        NEXT_FAILURE.with(|next| {
+            if next.get() == Some(site) {
+                next.set(None);
+                true
+            } else {
+                false
+            }
+        })
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn inject_descriptor_allocation_failure_for_test(site: DescriptorAllocationFailureSite) {
+    descriptor_allocation_failure::inject(site);
+}
+
+fn inject_descriptor_allocation_failure(site: DescriptorAllocationFailureSite) -> Result<()> {
+    #[cfg(test)]
+    if descriptor_allocation_failure::should_fail(site) {
+        return Err(encode_allocation());
+    }
+    let _ = site;
+    Ok(())
 }
 
 fn encode_invalid() -> StorageError {

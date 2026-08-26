@@ -9,7 +9,7 @@ pub struct WriteBatch {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum BatchOperation {
+pub(crate) enum BatchOperation {
     Put { key: Vec<u8>, value: Vec<u8> },
     Delete { key: Vec<u8> },
 }
@@ -59,6 +59,16 @@ impl WriteBatch {
 
     pub fn is_empty(&self) -> bool {
         self.operations.is_empty()
+    }
+
+    pub(crate) fn operations(&self) -> &[BatchOperation] {
+        &self.operations
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)] // Used by path-included integration tests, not the library test target.
+    pub(crate) fn push_delete_unchecked_for_test(&mut self, key: Vec<u8>) {
+        self.operations.push(BatchOperation::Delete { key });
     }
 }
 
@@ -225,6 +235,29 @@ mod tests {
             assert_eq!(batch.operations, before);
 
             batch.put(b"new-key", b"new-value").unwrap();
+            assert_eq!(batch.len(), 2);
+        }
+    }
+
+    #[test]
+    fn delete_allocation_failures_leave_batch_byte_for_byte_unchanged() {
+        for site in [Site::Key, Site::Operations] {
+            let mut batch = WriteBatch::new();
+            batch.put(b"existing-key", b"existing-value").unwrap();
+            let before = batch.operations.clone();
+
+            allocation_failure::inject(site);
+            let error = batch.delete(b"deleted-key").unwrap_err();
+
+            assert_eq!(error.kind, StorageErrorKind::ResourceExhausted);
+            assert_eq!(error.operation, Operation::WriteBatch);
+            assert_eq!(error.protocol_stage, ProtocolStage::Preflight);
+            assert_eq!(error.write_outcome, Some(WriteOutcome::NotCommitted));
+            assert_eq!(error.instance_state, None::<InstanceState>);
+            assert_eq!(error.retry_advice, RetryAdvice::RetrySameInstance);
+            assert_eq!(batch.operations, before);
+
+            batch.delete(b"deleted-key").unwrap();
             assert_eq!(batch.len(), 2);
         }
     }

@@ -901,6 +901,7 @@ fn zeroed_record(encoded_len: u32) -> Result<Vec<u8>> {
     let len = usize::try_from(encoded_len)
         .map_err(|_| invalid_vlog_error(StorageErrorKind::InvalidArgument))?;
     let mut encoded = Vec::new();
+    inject_prepare_allocation_failure(PrepareAllocationFailureSite::RecordBytes)?;
     encoded
         .try_reserve_exact(len)
         .map_err(|_| invalid_vlog_error(StorageErrorKind::ResourceExhausted))?;
@@ -1191,6 +1192,7 @@ impl LayoutPlanner {
 
     fn plan_record_inner(&mut self, encoded_len: u32) -> Result<RecordPlacement> {
         let mut preludes = Vec::new();
+        inject_prepare_allocation_failure(PrepareAllocationFailureSite::PlacementPreludes)?;
         preludes
             .try_reserve(4)
             .map_err(|_| invalid_vlog_error(StorageErrorKind::ResourceExhausted))?;
@@ -1299,6 +1301,18 @@ pub(crate) enum LogicalOperationRef<'a> {
     Delete { key: &'a [u8] },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PrepareAllocationFailureSite {
+    DistinctKeys,
+    RecordLengths,
+    PlacementPreludes,
+    Placements,
+    Chunks,
+    ValuePointers,
+    RecordBytes,
+    StructuralBytes,
+}
+
 fn operation_key<'a>(operation: LogicalOperationRef<'a>) -> &'a [u8] {
     match operation {
         LogicalOperationRef::Put { key, .. } | LogicalOperationRef::Delete { key } => key,
@@ -1338,12 +1352,14 @@ pub(crate) fn prepare_envelope(
     let logical_op_count = u64::try_from(operations.len())
         .map_err(|_| invalid_vlog_error(StorageErrorKind::CapacityExceeded))?;
     let mut distinct_keys = HashSet::new();
+    inject_prepare_allocation_failure(PrepareAllocationFailureSite::DistinctKeys)?;
     distinct_keys
         .try_reserve(operations.len())
         .map_err(|_| invalid_vlog_error(StorageErrorKind::ResourceExhausted))?;
     let mut kv_record_count = 0_u64;
     let mut delete_record_count = 0_u64;
     let mut record_lengths = Vec::new();
+    inject_prepare_allocation_failure(PrepareAllocationFailureSite::RecordLengths)?;
     record_lengths
         .try_reserve(
             operations
@@ -1404,6 +1420,7 @@ pub(crate) fn prepare_envelope(
     let vlog_begin = planner.position();
     let mut candidate = planner.clone();
     let mut placements = Vec::new();
+    inject_prepare_allocation_failure(PrepareAllocationFailureSite::Placements)?;
     placements
         .try_reserve(record_lengths.len())
         .map_err(|_| invalid_vlog_error(StorageErrorKind::ResourceExhausted))?;
@@ -1464,10 +1481,12 @@ pub(crate) fn prepare_envelope(
         })
         .ok_or_else(|| invalid_vlog_error(StorageErrorKind::CapacityExceeded))?;
     let mut chunks = Vec::new();
+    inject_prepare_allocation_failure(PrepareAllocationFailureSite::Chunks)?;
     chunks
         .try_reserve(chunk_capacity)
         .map_err(|_| invalid_vlog_error(StorageErrorKind::ResourceExhausted))?;
     let mut value_pointers = Vec::new();
+    inject_prepare_allocation_failure(PrepareAllocationFailureSite::ValuePointers)?;
     value_pointers
         .try_reserve(operations.len())
         .map_err(|_| invalid_vlog_error(StorageErrorKind::ResourceExhausted))?;
@@ -1575,21 +1594,24 @@ fn append_placement(
     }
     for prelude in placement.preludes.iter().copied() {
         let chunk = match prelude {
-            LayoutPrelude::PageHeader { position, page_no } => PhysicalChunk {
-                position,
-                bytes: PageHeader {
+            LayoutPrelude::PageHeader { position, page_no } => {
+                let encoded = PageHeader {
                     file_id: position.file_id,
                     page_no,
                 }
-                .encode()?
-                .to_vec(),
-            },
-            LayoutPrelude::FileHeader { position } => PhysicalChunk {
-                position,
-                bytes: VLogFileHeader::new(database_uuid, position.file_id)
-                    .encode()?
-                    .to_vec(),
-            },
+                .encode()?;
+                PhysicalChunk {
+                    position,
+                    bytes: try_copy_structural_bytes(&encoded)?,
+                }
+            }
+            LayoutPrelude::FileHeader { position } => {
+                let encoded = VLogFileHeader::new(database_uuid, position.file_id).encode()?;
+                PhysicalChunk {
+                    position,
+                    bytes: try_copy_structural_bytes(&encoded)?,
+                }
+            }
             LayoutPrelude::PageEnd {
                 position,
                 encoded_len,
@@ -2050,6 +2072,56 @@ fn read_u64(encoded: &[u8], offset: usize) -> Result<u64> {
         .try_into()
         .map_err(|_| decode_error(StorageErrorKind::Corruption))?;
     Ok(u64::from_le_bytes(bytes))
+}
+
+fn try_copy_structural_bytes<const N: usize>(bytes: &[u8; N]) -> Result<Vec<u8>> {
+    inject_prepare_allocation_failure(PrepareAllocationFailureSite::StructuralBytes)?;
+    let mut owned = Vec::new();
+    owned
+        .try_reserve_exact(N)
+        .map_err(|_| invalid_vlog_error(StorageErrorKind::ResourceExhausted))?;
+    owned.extend_from_slice(bytes);
+    Ok(owned)
+}
+
+#[cfg(test)]
+mod prepare_allocation_failure {
+    use std::cell::Cell;
+
+    use super::PrepareAllocationFailureSite;
+
+    thread_local! {
+        static NEXT_FAILURE: Cell<Option<PrepareAllocationFailureSite>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn inject(site: PrepareAllocationFailureSite) {
+        NEXT_FAILURE.with(|next| assert!(next.replace(Some(site)).is_none()));
+    }
+
+    pub(super) fn should_fail(site: PrepareAllocationFailureSite) -> bool {
+        NEXT_FAILURE.with(|next| {
+            if next.get() == Some(site) {
+                next.set(None);
+                true
+            } else {
+                false
+            }
+        })
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn inject_prepare_allocation_failure_for_test(site: PrepareAllocationFailureSite) {
+    prepare_allocation_failure::inject(site);
+}
+
+fn inject_prepare_allocation_failure(site: PrepareAllocationFailureSite) -> Result<()> {
+    #[cfg(test)]
+    if prepare_allocation_failure::should_fail(site) {
+        return Err(invalid_vlog_error(StorageErrorKind::ResourceExhausted));
+    }
+    let _ = site;
+    Ok(())
 }
 
 fn invalid_vlog_error(kind: StorageErrorKind) -> StorageError {
