@@ -357,6 +357,40 @@ impl ValueLogWriter {
         &self.dirty
     }
 
+    pub(crate) fn database_uuid(&self) -> [u8; 16] {
+        self.database_uuid
+    }
+
+    pub(crate) fn geometry(&self) -> VLogGeometry {
+        self.geometry
+    }
+
+    pub(crate) fn has_terminal_failure(&self) -> bool {
+        self.append_failed
+    }
+
+    pub(crate) fn active_file_id(&self) -> Option<u32> {
+        match &self.state {
+            AppendState::Open { file_id, .. } => Some(*file_id),
+            AppendState::Empty | AppendState::AtFileLimit { .. } => None,
+        }
+    }
+
+    pub(crate) fn file_count(&self) -> u32 {
+        match &self.state {
+            AppendState::Empty => 0,
+            AppendState::Open { file_id, .. } => file_id.saturating_add(1),
+            AppendState::AtFileLimit { last_file_id } => last_file_id.saturating_add(1),
+        }
+    }
+
+    pub(crate) fn logical_bytes(&self) -> u64 {
+        let position = self.position();
+        u64::from(position.file_id)
+            .saturating_mul(self.geometry.max_file_size)
+            .saturating_add(position.offset)
+    }
+
     pub(crate) fn append(&mut self, envelope: &PreparedEnvelope) -> Result<()> {
         if self.append_failed {
             return Err(writer_stopped(envelope.commit_seq, envelope.vlog_begin));

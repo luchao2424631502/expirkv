@@ -60,6 +60,28 @@ impl RuntimeControl {
         self.first_latched_error.get().cloned()
     }
 
+    /// Confirms a no-queue write completion point under the same gate used by
+    /// ordinary write admission. Empty non-sync batches use this path.
+    pub(crate) fn check_write_admission(&self, operation: Operation) -> Result<()> {
+        let fast_state = self.state();
+        if fast_state.instance_state != InstanceState::Healthy {
+            return Err(super::write_gate::admission_error(
+                operation,
+                fast_state.instance_state,
+            ));
+        }
+
+        let gate = lock_gate(&self.gate);
+        let checked_state = self.state();
+        if checked_state.instance_state != InstanceState::Healthy || !gate.accepting_writes {
+            return Err(super::write_gate::admission_error(
+                operation,
+                checked_state.instance_state,
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn enqueue_write(self: &Arc<Self>, operation: Operation) -> Result<WriteTicket> {
         let fast_state = self.state();
         if fast_state.instance_state != InstanceState::Healthy {
@@ -95,12 +117,41 @@ impl RuntimeControl {
         Ok(WriteTicket::new(Arc::clone(self), request))
     }
 
+    pub(crate) fn required_failure_state(
+        &self,
+        target: InstanceState,
+        error: &StorageError,
+    ) -> InstanceState {
+        let required = if error.write_outcome == Some(WriteOutcome::CommitUnknown)
+            || error.protocol_stage == ProtocolStage::VLogSync
+            || matches!(
+                error.kind,
+                StorageErrorKind::Corruption
+                    | StorageErrorKind::InvalidLayout
+                    | StorageErrorKind::IncompatibleFormat
+                    | StorageErrorKind::StoragePoisoned
+                    | StorageErrorKind::Unrecoverable
+            ) {
+            InstanceState::Poisoned
+        } else if error.kind == StorageErrorKind::StorageWriteStopped {
+            InstanceState::WriteStopped
+        } else {
+            InstanceState::Healthy
+        };
+
+        if state_rank(required) > state_rank(target) {
+            required
+        } else {
+            target
+        }
+    }
+
     pub(crate) fn latch_failure(
         &self,
         target: InstanceState,
         error: &StorageError,
     ) -> StateTransition {
-        let target = required_failure_state(target, error);
+        let target = self.required_failure_state(target, error);
         let summary = LatchedErrorSummary::from_storage_error(error);
         let (transition, cancelled) = {
             let mut gate = lock_gate(&self.gate);
@@ -239,6 +290,11 @@ impl RuntimeControl {
         lock_gate(&self.gate).active_request
     }
 
+    #[cfg(test)]
+    pub(crate) fn queued_write_count_for_test(&self) -> usize {
+        lock_gate(&self.gate).ordered_queue.len()
+    }
+
     fn publish_stats(&self, snapshot: StateSnapshot) {
         self.stats.update_runtime_state(
             snapshot.instance_state,
@@ -267,31 +323,6 @@ fn state_rank(state: InstanceState) -> u8 {
 
 fn is_upgrade(current: InstanceState, target: InstanceState) -> bool {
     state_rank(target) > state_rank(current)
-}
-
-fn required_failure_state(target: InstanceState, error: &StorageError) -> InstanceState {
-    let required = if error.write_outcome == Some(WriteOutcome::CommitUnknown)
-        || error.protocol_stage == ProtocolStage::VLogSync
-        || matches!(
-            error.kind,
-            StorageErrorKind::Corruption
-                | StorageErrorKind::InvalidLayout
-                | StorageErrorKind::IncompatibleFormat
-                | StorageErrorKind::StoragePoisoned
-                | StorageErrorKind::Unrecoverable
-        ) {
-        InstanceState::Poisoned
-    } else if error.kind == StorageErrorKind::StorageWriteStopped {
-        InstanceState::WriteStopped
-    } else {
-        InstanceState::Healthy
-    };
-
-    if state_rank(required) > state_rank(target) {
-        required
-    } else {
-        target
-    }
 }
 
 fn encode_state(snapshot: StateSnapshot) -> u64 {

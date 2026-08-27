@@ -85,6 +85,29 @@ impl StatsState {
             snapshot.first_latched_error = first_latched_error;
         }
     }
+
+    pub(crate) fn update_commit_state(
+        &self,
+        head_seq: u64,
+        durable_seq: u64,
+        durable_vlog_end: Option<(u32, u64)>,
+        active_vlog_file_id: Option<u32>,
+        vlog_file_count: u32,
+        vlog_logical_bytes: u64,
+    ) {
+        let mut snapshot = match self.snapshot.write() {
+            Ok(snapshot) => snapshot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        snapshot.head_seq = head_seq;
+        snapshot.durable_seq = durable_seq;
+        snapshot.durability_lag = head_seq.saturating_sub(durable_seq);
+        snapshot.durable_vlog_end =
+            durable_vlog_end.map(|(file_id, offset)| VLogPosition { file_id, offset });
+        snapshot.active_vlog_file_id = active_vlog_file_id;
+        snapshot.vlog_file_count = vlog_file_count;
+        snapshot.vlog_logical_bytes = vlog_logical_bytes;
+    }
 }
 
 impl Default for StatsState {

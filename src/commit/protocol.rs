@@ -57,6 +57,10 @@ impl ValidatedWrite<'_> {
     pub(crate) fn sync(&self) -> bool {
         self.normalized.sync
     }
+
+    pub(crate) fn public_operation(&self) -> Operation {
+        self.public_operation
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

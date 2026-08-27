@@ -178,6 +178,24 @@ impl StorageError {
         )
     }
 
+    pub(crate) fn write_protocol(
+        kind: StorageErrorKind,
+        operation: Operation,
+        protocol_stage: ProtocolStage,
+        write_outcome: WriteOutcome,
+        instance_state: InstanceState,
+        retry_advice: RetryAdvice,
+    ) -> Self {
+        Self::new(
+            kind,
+            operation,
+            protocol_stage,
+            Some(write_outcome),
+            Some(instance_state),
+            retry_advice,
+        )
+    }
+
     pub(crate) fn invalid_iterator_target(instance_state: InstanceState) -> Self {
         Self::new(
             StorageErrorKind::InvalidArgument,

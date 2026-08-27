@@ -12,15 +12,20 @@ pub(crate) use error::{
 
 #[path = "../src/batch.rs"]
 mod batch;
-#[path = "../src/vlog/format.rs"]
-pub(crate) mod vlog_format;
-mod vlog {
-    pub(crate) use crate::vlog_format as format;
-}
+#[path = "../src/lock.rs"]
+mod lock;
+#[path = "../src/stats.rs"]
+mod stats;
+pub(crate) use stats::{DbStats, LatchedErrorSummary, VLogPosition as PublicVLogPosition};
+#[path = "../src/vlog/mod.rs"]
+mod vlog;
+pub(crate) use vlog::format as vlog_format;
 #[path = "../src/commit/mod.rs"]
 mod commit;
 #[path = "../src/index/mod.rs"]
 mod index;
+#[path = "../src/runtime/mod.rs"]
+mod runtime;
 
 use batch::WriteBatch;
 use commit::{
