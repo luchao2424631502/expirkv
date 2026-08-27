@@ -207,6 +207,21 @@ impl StorageError {
         )
     }
 
+    pub(crate) fn read_error(
+        kind: StorageErrorKind,
+        instance_state: InstanceState,
+        retry_advice: RetryAdvice,
+    ) -> Self {
+        Self::new(
+            kind,
+            Operation::Get,
+            ProtocolStage::Read,
+            None,
+            Some(instance_state),
+            retry_advice,
+        )
+    }
+
     #[allow(dead_code)] // Stage 2 codecs are connected to production paths in later stages.
     pub(crate) fn codec_error(
         kind: StorageErrorKind,

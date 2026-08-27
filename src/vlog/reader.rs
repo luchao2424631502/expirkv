@@ -10,6 +10,8 @@ use crate::{Operation, ProtocolStage, Result, RetryAdvice, StorageError, Storage
 pub(crate) struct ValueLogReader {
     files: Arc<FileSet>,
     geometry: VLogGeometry,
+    #[cfg(test)]
+    positioned_read: Option<Arc<dyn crate::vlog::file_set::PositionedRead>>,
 }
 
 impl ValueLogReader {
@@ -19,7 +21,23 @@ impl ValueLogReader {
         if files.geometry() != geometry {
             return Err(reader_configuration_error());
         }
-        Ok(Self { files, geometry })
+        Ok(Self {
+            files,
+            geometry,
+            #[cfg(test)]
+            positioned_read: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_positioned_read(
+        files: Arc<FileSet>,
+        geometry: VLogGeometry,
+        positioned_read: Arc<dyn crate::vlog::file_set::PositionedRead>,
+    ) -> Result<Self> {
+        let mut reader = Self::new(files, geometry)?;
+        reader.positioned_read = Some(positioned_read);
+        Ok(reader)
     }
 
     pub(crate) fn read_value(
@@ -27,7 +45,8 @@ impl ValueLogReader {
         encoded_pointer: &[u8],
         expected_key: &[u8],
     ) -> Result<Vec<u8>> {
-        let pointer = ValuePointer::decode(encoded_pointer)?;
+        let pointer = ValuePointer::decode(encoded_pointer)
+            .map_err(|error| read_context(error, None, None))?;
         self.read_pointer(pointer, expected_key)
     }
 
@@ -56,6 +75,24 @@ impl ValueLogReader {
             .try_reserve_exact(record_len)
             .map_err(|_| read_resource(pointer.file_id, pointer.record_offset))?;
         encoded.resize(record_len, 0);
+        #[cfg(test)]
+        if let Some(positioned_read) = &self.positioned_read {
+            crate::vlog::file_set::read_exact_at_with(
+                positioned_read.as_ref(),
+                &handle,
+                &mut encoded,
+                u64::from(pointer.record_offset),
+                pointer.file_id,
+            )?;
+        } else {
+            read_exact_at(
+                &handle,
+                &mut encoded,
+                u64::from(pointer.record_offset),
+                pointer.file_id,
+            )?;
+        }
+        #[cfg(not(test))]
         read_exact_at(
             &handle,
             &mut encoded,
@@ -89,6 +126,13 @@ impl ValueLogReader {
 
     pub(crate) fn files(&self) -> &Arc<FileSet> {
         &self.files
+    }
+}
+
+#[cfg(not(test))]
+impl crate::db::ValueReader for ValueLogReader {
+    fn read_value(&self, encoded_pointer: &[u8], expected_key: &[u8]) -> Result<Vec<u8>> {
+        ValueLogReader::read_value(self, encoded_pointer, expected_key)
     }
 }
 

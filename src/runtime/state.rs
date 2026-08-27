@@ -306,6 +306,33 @@ impl RuntimeControl {
     }
 }
 
+#[cfg(not(test))]
+impl crate::db::ReadRuntime for RuntimeControl {
+    fn state_snapshot(&self) -> crate::db::ReadStateSnapshot {
+        let state = self.state();
+        crate::db::ReadStateSnapshot {
+            instance_state: state.instance_state,
+            state_epoch: state.state_epoch,
+        }
+    }
+
+    fn latch_read_failure(
+        &self,
+        target: InstanceState,
+        error: &StorageError,
+    ) -> crate::db::ReadStateSnapshot {
+        let state = self.latch_failure(target, error).current;
+        crate::db::ReadStateSnapshot {
+            instance_state: state.instance_state,
+            state_epoch: state.state_epoch,
+        }
+    }
+
+    fn read_stats(&self) -> crate::DbStats {
+        self.stats()
+    }
+}
+
 fn lock_gate(gate: &Mutex<WriteGateInner>) -> std::sync::MutexGuard<'_, WriteGateInner> {
     match gate.lock() {
         Ok(guard) => guard,

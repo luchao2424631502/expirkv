@@ -538,16 +538,51 @@ fn vlog_file_name_c(file_id: u32) -> io::Result<CString> {
 
 pub(crate) fn read_exact_at(
     file: &File,
-    mut buffer: &mut [u8],
-    mut offset: u64,
+    buffer: &mut [u8],
+    offset: u64,
     file_id: u32,
 ) -> Result<()> {
     use std::os::unix::fs::FileExt;
 
+    read_exact_at_impl(
+        |buffer, offset| file.read_at(buffer, offset),
+        buffer,
+        offset,
+        file_id,
+    )
+}
+
+#[cfg(test)]
+pub(crate) trait PositionedRead: Send + Sync {
+    fn read_at(&self, file: &File, buffer: &mut [u8], offset: u64) -> io::Result<usize>;
+}
+
+#[cfg(test)]
+pub(crate) fn read_exact_at_with(
+    reader: &dyn PositionedRead,
+    file: &File,
+    buffer: &mut [u8],
+    offset: u64,
+    file_id: u32,
+) -> Result<()> {
+    read_exact_at_impl(
+        |buffer, offset| reader.read_at(file, buffer, offset),
+        buffer,
+        offset,
+        file_id,
+    )
+}
+
+fn read_exact_at_impl(
+    mut read_at: impl FnMut(&mut [u8], u64) -> io::Result<usize>,
+    mut buffer: &mut [u8],
+    mut offset: u64,
+    file_id: u32,
+) -> Result<()> {
     let mut interrupted_attempts = 0_usize;
     let mut transient_attempts = 0_usize;
     while !buffer.is_empty() {
-        match file.read_at(buffer, offset) {
+        match read_at(buffer, offset) {
             Ok(0) => return Err(read_corruption(file_id, Some(offset))),
             Ok(read) => {
                 let read_u64 =

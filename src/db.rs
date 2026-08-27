@@ -21,7 +21,6 @@ use crate::lock::{
     ManagedEntryKind, RootLock, invalid_argument_error, layout_error, not_found_error,
     open_io_error, sync_directory_tree_nofollow, sync_file_data,
 };
-use crate::stats::StatsState;
 use crate::{
     DbIterator, DbStats, InstanceState, KeyRange, Operation, Options, ProtocolStage, RangeCursor,
     ReadOptions, Result, RetryAdvice, Snapshot, StorageError, StorageErrorKind, WriteBatch,
@@ -30,6 +29,7 @@ use crate::{
 
 const INDEX_DIRECTORY_NAME: &str = "index";
 const VLOG_DIRECTORY_NAME: &str = "vlog";
+const MAX_KEY_VALUE_SIZE: usize = 60_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct VLogInventoryEntry {
@@ -569,13 +569,47 @@ fn retry_advice_for(kind: StorageErrorKind) -> RetryAdvice {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ReadStateSnapshot {
+    pub(crate) instance_state: InstanceState,
+    pub(crate) state_epoch: u64,
+}
+
+pub(crate) trait ReadRuntime: Send + Sync {
+    fn state_snapshot(&self) -> ReadStateSnapshot;
+
+    fn latch_read_failure(&self, target: InstanceState, error: &StorageError) -> ReadStateSnapshot;
+
+    fn read_stats(&self) -> DbStats;
+}
+
+pub(crate) trait UserIndexReader: Send + Sync {
+    fn get_user_pointer(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
+}
+
+impl<T: IndexBackend> UserIndexReader for T {
+    fn get_user_pointer(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.get_user(key, None)
+    }
+}
+
+pub(crate) trait ValueReader: Send + Sync {
+    fn read_value(&self, encoded_pointer: &[u8], expected_key: &[u8]) -> Result<Vec<u8>>;
+}
+
+struct ReadPath {
+    runtime: Arc<dyn ReadRuntime>,
+    index: Arc<dyn UserIndexReader>,
+    values: Arc<dyn ValueReader>,
+}
+
 pub(crate) struct DbInner {
-    stats: StatsState,
+    read_path: ReadPath,
 }
 
 impl DbInner {
     pub(crate) fn instance_state(&self) -> InstanceState {
-        self.stats.snapshot().instance_state
+        self.read_path.runtime.state_snapshot().instance_state
     }
 
     pub(crate) fn unsupported_error(
@@ -585,6 +619,166 @@ impl DbInner {
     ) -> StorageError {
         StorageError::unsupported(operation, protocol_stage, Some(self.instance_state()))
     }
+
+    fn get(&self, options: &ReadOptions<'_>, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let started = self.begin_read()?;
+        if options.snapshot.is_some() {
+            return Err(StorageError::unsupported(
+                Operation::Get,
+                ProtocolStage::Read,
+                Some(started.instance_state),
+            ));
+        }
+        if key.is_empty() || key.len() > MAX_KEY_VALUE_SIZE {
+            return Err(StorageError::read_error(
+                StorageErrorKind::InvalidArgument,
+                started.instance_state,
+                RetryAdvice::FixRequestAndRetrySameInstance,
+            ));
+        }
+
+        let encoded_pointer = match self.read_path.index.get_user_pointer(key) {
+            Ok(pointer) => pointer,
+            Err(error) => return Err(self.handle_read_failure(error, ReadFailureDomain::Index)),
+        };
+        let Some(encoded_pointer) = encoded_pointer else {
+            self.complete_read(started)?;
+            return Ok(None);
+        };
+
+        let value = self
+            .read_path
+            .values
+            .read_value(&encoded_pointer, key)
+            .map_err(|error| self.handle_read_failure(error, ReadFailureDomain::ValueLog))?;
+        self.complete_read(started)?;
+        Ok(Some(value))
+    }
+
+    fn begin_read(&self) -> Result<ReadStateSnapshot> {
+        let state = self.read_path.runtime.state_snapshot();
+        if state.instance_state == InstanceState::Poisoned {
+            return Err(poisoned_read_error());
+        }
+        Ok(state)
+    }
+
+    fn complete_read(&self, started: ReadStateSnapshot) -> Result<()> {
+        let current = self.read_path.runtime.state_snapshot();
+        if current.instance_state == InstanceState::Poisoned
+            && current.state_epoch != started.state_epoch
+        {
+            return Err(poisoned_read_error());
+        }
+        Ok(())
+    }
+
+    fn handle_read_failure(
+        &self,
+        mut error: StorageError,
+        domain: ReadFailureDomain,
+    ) -> StorageError {
+        error.operation = Operation::Get;
+        error.protocol_stage = ProtocolStage::Read;
+        error.write_outcome = None;
+
+        let target = failure_target(domain, error.kind);
+        let expected_state =
+            target.unwrap_or_else(|| self.read_path.runtime.state_snapshot().instance_state);
+        error.retry_advice = read_retry_advice(domain, error.kind, expected_state);
+        let state = match target {
+            Some(target) => self.read_path.runtime.latch_read_failure(target, &error),
+            None => self.read_path.runtime.state_snapshot(),
+        };
+        error.instance_state = Some(state.instance_state);
+        error.retry_advice = read_retry_advice(domain, error.kind, state.instance_state);
+        error
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReadFailureDomain {
+    Index,
+    ValueLog,
+}
+
+fn failure_target(domain: ReadFailureDomain, kind: StorageErrorKind) -> Option<InstanceState> {
+    match (domain, kind) {
+        (_, StorageErrorKind::Busy | StorageErrorKind::ResourceExhausted) => None,
+        (_, StorageErrorKind::Io | StorageErrorKind::StorageWriteStopped)
+            if domain == ReadFailureDomain::ValueLog =>
+        {
+            Some(InstanceState::WriteStopped)
+        }
+        (ReadFailureDomain::Index, StorageErrorKind::StorageWriteStopped) => {
+            Some(InstanceState::WriteStopped)
+        }
+        (ReadFailureDomain::Index, _) | (ReadFailureDomain::ValueLog, _) => {
+            Some(InstanceState::Poisoned)
+        }
+    }
+}
+
+fn read_retry_advice(
+    domain: ReadFailureDomain,
+    kind: StorageErrorKind,
+    final_state: InstanceState,
+) -> RetryAdvice {
+    if final_state == InstanceState::Poisoned {
+        return match kind {
+            StorageErrorKind::Corruption
+            | StorageErrorKind::InvalidLayout
+            | StorageErrorKind::Unrecoverable => RetryAdvice::RestoreOrRepair,
+            StorageErrorKind::IncompatibleFormat
+            | StorageErrorKind::InvalidArgument
+            | StorageErrorKind::NotFound
+            | StorageErrorKind::Unsupported
+            | StorageErrorKind::CapacityExceeded => RetryAdvice::DoNotRetry,
+            StorageErrorKind::Busy
+            | StorageErrorKind::ResourceExhausted
+            | StorageErrorKind::Io
+            | StorageErrorKind::StorageWriteStopped
+            | StorageErrorKind::StoragePoisoned => RetryAdvice::ReopenAndVerify,
+        };
+    }
+
+    match (domain, kind) {
+        (_, StorageErrorKind::InvalidArgument) => RetryAdvice::FixRequestAndRetrySameInstance,
+        (_, StorageErrorKind::Busy | StorageErrorKind::ResourceExhausted) => {
+            RetryAdvice::RetrySameInstance
+        }
+        (_, StorageErrorKind::Io | StorageErrorKind::StorageWriteStopped) => {
+            RetryAdvice::FixEnvironmentAndReopen
+        }
+        (_, StorageErrorKind::StoragePoisoned) => RetryAdvice::ReopenAndVerify,
+        (
+            _,
+            StorageErrorKind::Corruption
+            | StorageErrorKind::InvalidLayout
+            | StorageErrorKind::Unrecoverable,
+        ) => RetryAdvice::RestoreOrRepair,
+        (_, StorageErrorKind::IncompatibleFormat)
+        | (
+            ReadFailureDomain::Index,
+            StorageErrorKind::NotFound
+            | StorageErrorKind::Unsupported
+            | StorageErrorKind::CapacityExceeded,
+        )
+        | (
+            ReadFailureDomain::ValueLog,
+            StorageErrorKind::NotFound
+            | StorageErrorKind::Unsupported
+            | StorageErrorKind::CapacityExceeded,
+        ) => RetryAdvice::DoNotRetry,
+    }
+}
+
+fn poisoned_read_error() -> StorageError {
+    StorageError::read_error(
+        StorageErrorKind::StoragePoisoned,
+        InstanceState::Poisoned,
+        RetryAdvice::ReopenAndVerify,
+    )
 }
 
 #[derive(Clone)]
@@ -593,6 +787,27 @@ pub struct Db {
 }
 
 impl Db {
+    pub(crate) fn from_read_components<R, I, V>(
+        runtime: Arc<R>,
+        index: Arc<I>,
+        values: Arc<V>,
+    ) -> Self
+    where
+        R: ReadRuntime + 'static,
+        I: UserIndexReader + 'static,
+        V: ValueReader + 'static,
+    {
+        Self {
+            inner: Arc::new(DbInner {
+                read_path: ReadPath {
+                    runtime,
+                    index,
+                    values,
+                },
+            }),
+        }
+    }
+
     pub fn open(options: &Options, path: impl AsRef<Path>) -> Result<Self> {
         let _ = (options, path.as_ref());
         Err(StorageError::unsupported(
@@ -610,10 +825,7 @@ impl Db {
     }
 
     pub fn get(&self, options: &ReadOptions<'_>, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let _ = (options, key);
-        Err(self
-            .inner
-            .unsupported_error(Operation::Get, ProtocolStage::Read))
+        self.inner.get(options, key)
     }
 
     pub fn delete(&self, options: &WriteOptions, key: &[u8]) -> Result<()> {
@@ -656,7 +868,7 @@ impl Db {
     }
 
     pub fn stats(&self) -> DbStats {
-        self.inner.stats.snapshot()
+        self.inner.read_path.runtime.read_stats()
     }
 
     pub fn destroy(path: impl AsRef<Path>, options: &Options) -> Result<()> {
