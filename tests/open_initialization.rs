@@ -17,6 +17,8 @@ pub struct KeyRange<'a>(std::marker::PhantomData<&'a ()>);
 mod stats;
 pub(crate) use stats::{DbStats, LatchedErrorSummary, VLogPosition};
 
+#[path = "../src/commit/descriptor.rs"]
+mod commit;
 #[path = "../src/index/mod.rs"]
 mod index;
 #[path = "../src/options.rs"]

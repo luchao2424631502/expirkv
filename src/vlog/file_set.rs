@@ -412,6 +412,10 @@ impl FileSet {
         self.geometry
     }
 
+    pub(crate) fn database_uuid(&self) -> [u8; 16] {
+        self.database_uuid
+    }
+
     pub(crate) fn evict(&self, file_id: u32) -> Result<()> {
         let removed = self.read_cache.remove(file_id)?;
         drop(removed);

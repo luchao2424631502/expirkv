@@ -4,6 +4,7 @@
 use std::fs;
 use std::io::Read;
 
+use crate::commit::{DurableVLogEnd, VLogPos};
 use crate::db::{ManagedInventory, VLogInventoryEntry};
 use crate::format::{
     FORMAT_ENCODED_LEN, FORMAT_FILE_NAME, FORMAT_TEMP_FILE_NAME, FormatMetadataV0,
@@ -11,7 +12,7 @@ use crate::format::{
 use crate::lock::{ManagedEntryKind, RootLock, layout_error, open_io_error, open_regular_nofollow};
 use crate::vlog::format::{
     FILE_HEADER_ENCODED_LEN, MAX_VLOG_FILE_ID, MAX_VLOG_FILE_SIZE, PAGE_HEADER_ENCODED_LEN,
-    PageHeader, VLogFileHeader,
+    PageHeader, VLogFileHeader, VLogGeometry,
 };
 use crate::{Operation, ProtocolStage, Result, RetryAdvice, StorageError, StorageErrorKind};
 
@@ -21,6 +22,84 @@ const VLOG_DIRECTORY_NAME: &str = "vlog";
 const VLOG_PREFIX_LEN: usize = 1;
 const VLOG_DIGITS_LEN: usize = 6;
 const VLOG_SUFFIX: &str = ".data";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PhysicalTail {
+    Empty,
+    Position(VLogPos),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RecoveryTopology {
+    pub(crate) physical_tail: PhysicalTail,
+    pub(crate) file_count: usize,
+}
+
+impl RecoveryTopology {
+    pub(crate) fn analyze(
+        inventory: &ManagedInventory,
+        stable_end: DurableVLogEnd,
+    ) -> Result<Self> {
+        Self::analyze_with_geometry(inventory, stable_end, VLogGeometry::PRODUCTION)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn analyze_with_test_geometry(
+        inventory: &ManagedInventory,
+        stable_end: DurableVLogEnd,
+        geometry: VLogGeometry,
+    ) -> Result<Self> {
+        Self::analyze_with_geometry(inventory, stable_end, geometry)
+    }
+
+    fn analyze_with_geometry(
+        inventory: &ManagedInventory,
+        stable_end: DurableVLogEnd,
+        geometry: VLogGeometry,
+    ) -> Result<Self> {
+        validate_inventory_order(inventory, geometry)?;
+        validate_stable_files(inventory, stable_end, geometry)?;
+        let physical_tail = inventory
+            .vlog_files
+            .last()
+            .map_or(PhysicalTail::Empty, |entry| {
+                PhysicalTail::Position(VLogPos {
+                    file_id: entry.file_id,
+                    offset: entry.len,
+                })
+            });
+        Ok(Self {
+            physical_tail,
+            file_count: inventory.vlog_files.len(),
+        })
+    }
+
+    pub(crate) fn contains_end(&self, inventory: &ManagedInventory, end: DurableVLogEnd) -> bool {
+        match end {
+            DurableVLogEnd::Empty => true,
+            DurableVLogEnd::Position(position) => inventory
+                .vlog_files
+                .binary_search_by_key(&position.file_id, |entry| entry.file_id)
+                .ok()
+                .and_then(|index| inventory.vlog_files.get(index))
+                .is_some_and(|entry| entry.len >= position.offset),
+        }
+    }
+
+    pub(crate) fn has_suffix_after(
+        &self,
+        inventory: &ManagedInventory,
+        accepted_end: DurableVLogEnd,
+    ) -> bool {
+        match accepted_end {
+            DurableVLogEnd::Empty => !inventory.vlog_files.is_empty(),
+            DurableVLogEnd::Position(position) => inventory.vlog_files.iter().any(|entry| {
+                entry.file_id > position.file_id
+                    || (entry.file_id == position.file_id && entry.len > position.offset)
+            }),
+        }
+    }
+}
 
 impl ManagedInventory {
     pub(crate) fn inspect(root: &RootLock, format: &FormatMetadataV0) -> Result<Self> {
@@ -66,6 +145,58 @@ impl ManagedInventory {
         vlog_files.sort_unstable_by_key(|entry| entry.file_id);
         Ok(Self { vlog_files })
     }
+}
+
+fn validate_inventory_order(inventory: &ManagedInventory, geometry: VLogGeometry) -> Result<()> {
+    let mut previous = None;
+    for entry in &inventory.vlog_files {
+        if entry.file_id > geometry.max_file_id
+            || entry.len > geometry.max_file_size
+            || previous.is_some_and(|file_id| file_id >= entry.file_id)
+        {
+            return Err(corruption_error());
+        }
+        previous = Some(entry.file_id);
+    }
+    Ok(())
+}
+
+fn validate_stable_files(
+    inventory: &ManagedInventory,
+    stable_end: DurableVLogEnd,
+    geometry: VLogGeometry,
+) -> Result<()> {
+    let DurableVLogEnd::Position(stable_end) = stable_end else {
+        return Ok(());
+    };
+    if stable_end.file_id > geometry.max_file_id || stable_end.offset > geometry.max_file_size {
+        return Err(corruption_error());
+    }
+
+    let mut expected_file_id = 0_u32;
+    for entry in inventory
+        .vlog_files
+        .iter()
+        .take_while(|entry| entry.file_id <= stable_end.file_id)
+    {
+        if entry.file_id != expected_file_id {
+            return Err(corruption_error());
+        }
+        if entry.file_id < stable_end.file_id {
+            if entry.len != geometry.max_file_size {
+                return Err(corruption_error());
+            }
+            expected_file_id = expected_file_id
+                .checked_add(1)
+                .ok_or_else(corruption_error)?;
+        } else {
+            if entry.len < stable_end.offset {
+                return Err(corruption_error());
+            }
+            return Ok(());
+        }
+    }
+    Err(corruption_error())
 }
 
 fn validate_file_identity(

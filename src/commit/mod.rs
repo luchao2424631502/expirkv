@@ -8,7 +8,11 @@ mod protocol;
 #[allow(unused_imports)]
 pub(crate) use coordinator::{CommitCoordinator, CommitStateSnapshot};
 #[allow(unused_imports)]
-pub(crate) use descriptor::{DurableFrontier, DurableVLogEnd};
+pub(crate) use descriptor::{
+    CommitSeq, DurableFrontier, DurableVLogEnd, RECOVERY_STATE_KEY, RecoveryPhase, RecoveryState,
+    TransactionDescriptor, TxMutation, TxUuid, VLogPos, ValueState, decode_descriptor,
+    decode_head_seq, decode_tx_meta_key, decode_tx_mutation_key, encode_tx_meta_key,
+};
 
 #[allow(unused_imports)]
 pub(crate) use protocol::{
@@ -26,6 +30,5 @@ pub(crate) use protocol::{
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) use descriptor::{
-    DescriptorAllocationFailureSite, TransactionDescriptor, TxMutation, VLogPos, ValueState,
-    decode_descriptor, decode_head_seq, inject_descriptor_allocation_failure_for_test,
+    DescriptorAllocationFailureSite, inject_descriptor_allocation_failure_for_test,
 };
