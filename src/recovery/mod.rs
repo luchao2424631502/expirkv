@@ -9,11 +9,15 @@ use crate::commit::{
 use crate::db::ManagedInventory;
 use crate::format::FormatMetadataV0;
 use crate::index::{
-    DURABLE_FRONTIER_KEY, DatabaseIdentityV0, HEAD_SEQ_KEY, IndexBackend, IndexEntry,
+    DURABLE_FRONTIER_KEY, DatabaseIdentityV0, HEAD_SEQ_KEY, IndexApplyState, IndexAtomicBatch,
+    IndexBackend, IndexCommitError, IndexCommitMode, IndexEntry, IndexMutation, InternalIndexError,
     InternalIndexSpace, InternalKeyRange,
 };
+use crate::lock::RootLock;
+use crate::vlog::file_set::VLogDirectory;
 use crate::vlog::format::{VLogGeometry, VLogPosition};
 use crate::vlog::reader::{EnvelopeValueState, RecoveryEnvelope, ValueLogReader};
+use crate::vlog::writer::{ValueLogRecovery, ValueLogWriter};
 use crate::{Operation, ProtocolStage, Result, RetryAdvice, StorageError, StorageErrorKind};
 
 mod topology;
@@ -21,6 +25,13 @@ mod undo;
 
 pub(crate) use topology::PhysicalTail;
 use topology::RecoveryTopology;
+#[cfg(test)]
+pub(crate) fn fail_next_inventory_inspect_for_test() {
+    topology::fail_next_inventory_inspect_for_test();
+}
+use undo::undo_transactions;
+
+const VLOG_DIRECTORY_NAME: &str = "vlog";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RecoveryPlan {
@@ -36,6 +47,436 @@ pub(crate) struct RecoveryPlan {
     pub(crate) needs_undo: bool,
     pub(crate) needs_promote: bool,
     pub(crate) needs_trim: bool,
+}
+
+pub(crate) struct RecoveredState {
+    pub(crate) head_seq: u64,
+    pub(crate) durable_frontier: DurableFrontier,
+    pub(crate) writer: ValueLogWriter,
+}
+
+pub(crate) fn execute_recovery<B: IndexBackend>(
+    backend: &B,
+    plan: RecoveryPlan,
+    root: &RootLock,
+    format: &FormatMetadataV0,
+    reader: &ValueLogReader,
+    vlog: ValueLogRecovery,
+) -> Result<RecoveredState> {
+    execute_recovery_with_policy(
+        backend,
+        plan,
+        root,
+        format,
+        reader,
+        vlog,
+        RecoveryGeometry::Production,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn execute_recovery_with_test_geometry<B: IndexBackend>(
+    backend: &B,
+    plan: RecoveryPlan,
+    root: &RootLock,
+    format: &FormatMetadataV0,
+    reader: &ValueLogReader,
+    vlog: ValueLogRecovery,
+) -> Result<RecoveredState> {
+    let geometry = vlog.geometry();
+    execute_recovery_with_policy(
+        backend,
+        plan,
+        root,
+        format,
+        reader,
+        vlog,
+        RecoveryGeometry::Test(geometry),
+    )
+}
+
+fn execute_recovery_with_policy<B: IndexBackend>(
+    backend: &B,
+    plan: RecoveryPlan,
+    root: &RootLock,
+    format: &FormatMetadataV0,
+    reader: &ValueLogReader,
+    vlog: ValueLogRecovery,
+    geometry_policy: RecoveryGeometry,
+) -> Result<RecoveredState> {
+    validate_recovery_bindings(backend, &plan, root, format, reader, &vlog, geometry_policy)?;
+
+    let mut current_head = plan.head_seq;
+    let mut current_frontier = plan.durable_frontier;
+    let mut recovery_state = plan.recovery_state;
+
+    if recovery_state.is_none() && (plan.needs_undo || plan.needs_trim) {
+        let state = RecoveryState {
+            phase: RecoveryPhase::Undo,
+            original_head: plan.head_seq,
+            target_seq: plan.accepted_seq,
+            target_vlog_end: plan.accepted_end,
+            next_undo_seq: plan.head_seq,
+            trim_required: plan.needs_trim,
+        };
+        commit_recovery_batch(backend, recovery_state_batch(state)?)?;
+        recovery_state = Some(state);
+    }
+
+    if let Some(state) = recovery_state
+        && state.phase == RecoveryPhase::Undo
+    {
+        let undone = undo_transactions(backend, &plan, state)?;
+        let next_phase = if undone.trim_required {
+            RecoveryPhase::Trim
+        } else {
+            RecoveryPhase::Finalize
+        };
+        let next_state = RecoveryState {
+            phase: next_phase,
+            next_undo_seq: undone.target_seq,
+            ..undone
+        };
+        vlog.sync_accepted_range(
+            durable_end_position(current_frontier.durable_vlog_end),
+            durable_end_position(plan.accepted_end),
+        )?;
+        validate_accepted_boundary(reader, &plan)?;
+        let target_frontier = DurableFrontier {
+            durable_seq: plan.accepted_seq,
+            durable_vlog_end: plan.accepted_end,
+        };
+        commit_recovery_batch(
+            backend,
+            target_frontier_batch(plan.accepted_seq, target_frontier, Some(next_state))?,
+        )?;
+        current_head = plan.accepted_seq;
+        current_frontier = target_frontier;
+        recovery_state = Some(next_state);
+    } else if recovery_state.is_none() && plan.needs_promote {
+        vlog.sync_accepted_range(
+            durable_end_position(current_frontier.durable_vlog_end),
+            durable_end_position(plan.accepted_end),
+        )?;
+        validate_accepted_boundary(reader, &plan)?;
+        let target_frontier = DurableFrontier {
+            durable_seq: plan.accepted_seq,
+            durable_vlog_end: plan.accepted_end,
+        };
+        commit_recovery_batch(
+            backend,
+            target_frontier_batch(plan.accepted_seq, target_frontier, None)?,
+        )?;
+        current_head = plan.accepted_seq;
+        current_frontier = target_frontier;
+    }
+
+    if recovery_state.is_some_and(|state| state.phase == RecoveryPhase::Trim) {
+        let before_trim = ManagedInventory::inspect(root, format).map_err(recovery_context)?;
+        let file_ids = owned_inventory_file_ids(&before_trim)?;
+        vlog.trim(durable_end_position(plan.accepted_end), &file_ids)?;
+        let after_trim = ManagedInventory::inspect(root, format).map_err(recovery_context)?;
+        let topology = analyze_topology(&after_trim, plan.accepted_end, geometry_policy)?;
+        if !topology.physical_tail_matches(plan.accepted_end) {
+            return Err(recovery_corruption());
+        }
+        commit_recovery_batch(backend, delete_recovery_state_batch()?)?;
+        recovery_state = None;
+    } else if recovery_state.is_some_and(|state| state.phase == RecoveryPhase::Finalize) {
+        commit_recovery_batch(backend, delete_recovery_state_batch()?)?;
+        recovery_state = None;
+    }
+
+    if recovery_state.is_some() {
+        return Err(recovery_corruption());
+    }
+    verify_final_state(
+        backend,
+        &plan,
+        root,
+        format,
+        current_head,
+        current_frontier,
+        geometry_policy,
+    )?;
+    let writer = vlog.into_writer(durable_end_position(current_frontier.durable_vlog_end))?;
+    if writer.position() != to_vlog_position(append_position(current_frontier.durable_vlog_end)) {
+        return Err(recovery_corruption());
+    }
+    Ok(RecoveredState {
+        head_seq: current_head,
+        durable_frontier: current_frontier,
+        writer,
+    })
+}
+
+fn validate_recovery_bindings<B: IndexBackend>(
+    backend: &B,
+    plan: &RecoveryPlan,
+    root: &RootLock,
+    format: &FormatMetadataV0,
+    reader: &ValueLogReader,
+    vlog: &ValueLogRecovery,
+    geometry_policy: RecoveryGeometry,
+) -> Result<()> {
+    if vlog.geometry() != geometry_policy.geometry()
+        || reader.geometry() != geometry_policy.geometry()
+        || reader.files().database_uuid() != format.database_uuid
+        || vlog.database_uuid() != format.database_uuid
+        || !vlog.shares_file_set(reader.files())
+    {
+        return Err(recovery_corruption());
+    }
+
+    let current_identity = backend
+        .get_database_identity()
+        .map_err(recovery_context)?
+        .ok_or_else(recovery_corruption)?;
+    if current_identity != plan.database_identity {
+        return Err(recovery_corruption());
+    }
+    DatabaseIdentityV0::decode(&current_identity)
+        .map_err(recovery_context)?
+        .validate_against(format.format_version, format.database_uuid)
+        .map_err(recovery_context)?;
+
+    let expected_directory = VLogDirectory::open(&root.canonical_path().join(VLOG_DIRECTORY_NAME))
+        .map_err(recovery_context)?;
+    if expected_directory.writer_identity() != vlog.directory_identity() {
+        return Err(recovery_corruption());
+    }
+    Ok(())
+}
+
+fn validate_accepted_boundary(reader: &ValueLogReader, plan: &RecoveryPlan) -> Result<()> {
+    if plan.accepted_seq == plan.durable_frontier.durable_seq {
+        return validate_stable_boundary(
+            reader,
+            DurableFrontier {
+                durable_seq: plan.accepted_seq,
+                durable_vlog_end: plan.accepted_end,
+            },
+        );
+    }
+    let relative = plan
+        .accepted_seq
+        .checked_sub(plan.durable_frontier.durable_seq)
+        .and_then(|value| value.checked_sub(1))
+        .ok_or_else(recovery_corruption)?;
+    let index = usize::try_from(relative).map_err(|_| recovery_corruption())?;
+    let descriptor = plan
+        .descriptors
+        .get(index)
+        .ok_or_else(recovery_corruption)?;
+    if descriptor.meta.commit_seq != plan.accepted_seq
+        || DurableVLogEnd::Position(descriptor.meta.vlog_end) != plan.accepted_end
+    {
+        return Err(recovery_corruption());
+    }
+    read_and_validate_envelope(reader, descriptor)
+}
+
+fn recovery_state_batch(state: RecoveryState) -> Result<IndexAtomicBatch> {
+    let mut batch = IndexAtomicBatch::try_with_capacity(1).map_err(index_batch_context)?;
+    batch
+        .try_push(IndexMutation::PutInternal {
+            space: InternalIndexSpace::System,
+            key: try_copy_recovery_bytes(RECOVERY_STATE_KEY)?,
+            value: try_copy_recovery_bytes(&state.encode().map_err(recovery_context)?)?,
+        })
+        .map_err(index_batch_context)?;
+    Ok(batch)
+}
+
+fn target_frontier_batch(
+    head_seq: u64,
+    frontier: DurableFrontier,
+    state: Option<RecoveryState>,
+) -> Result<IndexAtomicBatch> {
+    if head_seq != frontier.durable_seq {
+        return Err(recovery_corruption());
+    }
+    let capacity = if state.is_some() { 3 } else { 2 };
+    let mut batch = IndexAtomicBatch::try_with_capacity(capacity).map_err(index_batch_context)?;
+    batch
+        .try_push(IndexMutation::PutInternal {
+            space: InternalIndexSpace::System,
+            key: try_copy_recovery_bytes(HEAD_SEQ_KEY)?,
+            value: try_copy_recovery_bytes(&head_seq.to_le_bytes())?,
+        })
+        .map_err(index_batch_context)?;
+    batch
+        .try_push(IndexMutation::PutInternal {
+            space: InternalIndexSpace::System,
+            key: try_copy_recovery_bytes(DURABLE_FRONTIER_KEY)?,
+            value: try_copy_recovery_bytes(&frontier.encode().map_err(recovery_context)?)?,
+        })
+        .map_err(index_batch_context)?;
+    if let Some(state) = state {
+        batch
+            .try_push(IndexMutation::PutInternal {
+                space: InternalIndexSpace::System,
+                key: try_copy_recovery_bytes(RECOVERY_STATE_KEY)?,
+                value: try_copy_recovery_bytes(&state.encode().map_err(recovery_context)?)?,
+            })
+            .map_err(index_batch_context)?;
+    }
+    Ok(batch)
+}
+
+fn delete_recovery_state_batch() -> Result<IndexAtomicBatch> {
+    let mut batch = IndexAtomicBatch::try_with_capacity(1).map_err(index_batch_context)?;
+    batch
+        .try_push(IndexMutation::DeleteInternal {
+            space: InternalIndexSpace::System,
+            key: try_copy_recovery_bytes(RECOVERY_STATE_KEY)?,
+        })
+        .map_err(index_batch_context)?;
+    Ok(batch)
+}
+
+fn commit_recovery_batch<B: IndexBackend>(backend: &B, batch: IndexAtomicBatch) -> Result<()> {
+    backend
+        .commit_atomic(batch, IndexCommitMode::SyncAll)
+        .map_err(recovery_commit_error)
+}
+
+fn recovery_commit_error(error: IndexCommitError) -> StorageError {
+    let retry_advice = match error.apply_state {
+        IndexApplyState::Unknown => RetryAdvice::ReopenAndVerify,
+        IndexApplyState::NotApplied => recovery_retry_advice(error.source.kind),
+    };
+    let mut mapped = StorageError::codec_error(
+        error.source.kind,
+        Operation::Open,
+        ProtocolStage::Recovery,
+        None,
+        retry_advice,
+    );
+    mapped.os_code = error.source.os_code;
+    mapped
+}
+
+fn index_batch_context(error: InternalIndexError) -> StorageError {
+    let mut mapped = StorageError::codec_error(
+        error.kind,
+        Operation::Open,
+        ProtocolStage::Recovery,
+        None,
+        recovery_retry_advice(error.kind),
+    );
+    mapped.os_code = error.os_code;
+    mapped
+}
+
+fn recovery_retry_advice(kind: StorageErrorKind) -> RetryAdvice {
+    match kind {
+        StorageErrorKind::InvalidArgument | StorageErrorKind::IncompatibleFormat => {
+            RetryAdvice::DoNotRetry
+        }
+        StorageErrorKind::Busy | StorageErrorKind::ResourceExhausted => {
+            RetryAdvice::RetrySameInstance
+        }
+        StorageErrorKind::Corruption
+        | StorageErrorKind::InvalidLayout
+        | StorageErrorKind::Unrecoverable
+        | StorageErrorKind::NotFound => RetryAdvice::RestoreOrRepair,
+        StorageErrorKind::Unsupported => RetryAdvice::DoNotRetry,
+        StorageErrorKind::CapacityExceeded
+        | StorageErrorKind::Io
+        | StorageErrorKind::StorageWriteStopped
+        | StorageErrorKind::StoragePoisoned => RetryAdvice::FixEnvironmentAndReopen,
+    }
+}
+
+fn verify_final_state<B: IndexBackend>(
+    backend: &B,
+    plan: &RecoveryPlan,
+    root: &RootLock,
+    format: &FormatMetadataV0,
+    expected_head: u64,
+    expected_frontier: DurableFrontier,
+    geometry_policy: RecoveryGeometry,
+) -> Result<()> {
+    let identity = backend
+        .get_database_identity()
+        .map_err(recovery_context)?
+        .ok_or_else(recovery_corruption)?;
+    if identity != plan.database_identity {
+        return Err(recovery_corruption());
+    }
+    DatabaseIdentityV0::decode(&identity)
+        .map_err(recovery_context)?
+        .validate_against(format.format_version, format.database_uuid)
+        .map_err(recovery_context)?;
+
+    let actual_head =
+        decode_head_seq(&required_internal(backend, HEAD_SEQ_KEY)?).map_err(recovery_context)?;
+    let actual_frontier =
+        DurableFrontier::decode(&required_internal(backend, DURABLE_FRONTIER_KEY)?)
+            .map_err(recovery_context)?;
+    actual_frontier
+        .validate_against_head(actual_head)
+        .map_err(recovery_context)?;
+    if actual_head != expected_head
+        || actual_frontier != expected_frontier
+        || backend
+            .get_internal(InternalIndexSpace::System, RECOVERY_STATE_KEY)
+            .map_err(recovery_context)?
+            .is_some()
+    {
+        return Err(recovery_corruption());
+    }
+
+    let inventory = ManagedInventory::inspect(root, format).map_err(recovery_context)?;
+    let topology = analyze_topology(
+        &inventory,
+        actual_frontier.durable_vlog_end,
+        geometry_policy,
+    )?;
+    if !topology.physical_tail_matches(actual_frontier.durable_vlog_end) {
+        return Err(recovery_corruption());
+    }
+    Ok(())
+}
+
+fn analyze_topology(
+    inventory: &ManagedInventory,
+    stable_end: DurableVLogEnd,
+    geometry_policy: RecoveryGeometry,
+) -> Result<RecoveryTopology> {
+    match geometry_policy {
+        RecoveryGeometry::Production => RecoveryTopology::analyze(inventory, stable_end),
+        #[cfg(test)]
+        RecoveryGeometry::Test(geometry) => {
+            RecoveryTopology::analyze_with_test_geometry(inventory, stable_end, geometry)
+        }
+    }
+}
+
+fn owned_inventory_file_ids(inventory: &ManagedInventory) -> Result<Vec<u32>> {
+    let mut file_ids = Vec::new();
+    file_ids
+        .try_reserve_exact(inventory.vlog_files.len())
+        .map_err(|_| recovery_resource())?;
+    file_ids.extend(inventory.vlog_files.iter().map(|entry| entry.file_id));
+    Ok(file_ids)
+}
+
+fn durable_end_position(end: DurableVLogEnd) -> Option<VLogPosition> {
+    match end {
+        DurableVLogEnd::Empty => None,
+        DurableVLogEnd::Position(position) => Some(to_vlog_position(position)),
+    }
+}
+
+fn try_copy_recovery_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
+    let mut owned = Vec::new();
+    owned
+        .try_reserve_exact(bytes.len())
+        .map_err(|_| recovery_resource())?;
+    owned.extend_from_slice(bytes);
+    Ok(owned)
 }
 
 pub(crate) fn analyze_recovery<B: IndexBackend>(

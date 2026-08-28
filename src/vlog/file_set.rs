@@ -157,7 +157,7 @@ impl VLogDirectory {
         })
     }
 
-    pub(super) fn writer_identity(&self) -> (u64, u64) {
+    pub(crate) fn writer_identity(&self) -> (u64, u64) {
         (self.identity.device, self.identity.inode)
     }
 
@@ -414,6 +414,14 @@ impl FileSet {
 
     pub(crate) fn database_uuid(&self) -> [u8; 16] {
         self.database_uuid
+    }
+
+    pub(crate) fn directory(&self) -> &Arc<VLogDirectory> {
+        &self.directory
+    }
+
+    pub(crate) fn catalog(&self) -> &Arc<FileCatalog> {
+        &self.catalog
     }
 
     pub(crate) fn evict(&self, file_id: u32) -> Result<()> {

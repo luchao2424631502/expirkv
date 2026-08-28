@@ -111,6 +111,22 @@ pub(crate) trait WriterIo: Send + Sync {
     fn sync_file(&self, file: &File) -> io::Result<()>;
     fn sync_directory(&self, directory: &VLogDirectory) -> io::Result<()>;
 
+    fn truncate_file(&self, file: &File, len: u64) -> io::Result<()> {
+        file.set_len(len)
+    }
+
+    fn before_remove_recovery_file(&self, _file_id: u32) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn after_remove_recovery_file(&self, _file_id: u32) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn after_recovery_trim(&self) -> io::Result<()> {
+        Ok(())
+    }
+
     #[cfg(test)]
     fn before_remove_new_file(&self, _file_id: u32) -> io::Result<()> {
         Ok(())
@@ -147,6 +163,215 @@ pub(crate) struct ValueLogWriter {
     append_failed: bool,
     last_appended: Option<AppendedTail>,
     io: Arc<dyn WriterIo>,
+}
+
+/// Exclusive VLog mutation capability used only while Open recovery is closed
+/// to public operations. It has no append state and becomes a writer only after
+/// RecoveryState has been cleared and the final topology has been verified.
+pub(crate) struct ValueLogRecovery {
+    directory: Arc<VLogDirectory>,
+    file_capability: WriterFileCapability,
+    database_uuid: [u8; 16],
+    geometry: VLogGeometry,
+    catalog: Arc<FileCatalog>,
+    files: Arc<crate::vlog::file_set::FileSet>,
+    io: Arc<dyn WriterIo>,
+}
+
+impl ValueLogRecovery {
+    pub(crate) fn new(files: Arc<crate::vlog::file_set::FileSet>) -> Result<Self> {
+        Self::new_inner(files, Arc::new(SystemWriterIo))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_io(
+        files: Arc<crate::vlog::file_set::FileSet>,
+        io: Arc<dyn WriterIo>,
+    ) -> Result<Self> {
+        Self::new_inner(files, io)
+    }
+
+    fn new_inner(
+        files: Arc<crate::vlog::file_set::FileSet>,
+        io: Arc<dyn WriterIo>,
+    ) -> Result<Self> {
+        let database_uuid = files.database_uuid();
+        let geometry = files.geometry();
+        validate_writer_identity(database_uuid, geometry)
+            .map_err(|error| recovery_vlog_context(error, None, None))?;
+        let directory = Arc::clone(files.directory());
+        let catalog = Arc::clone(files.catalog());
+        let file_capability = WriterFileCapability::claim(&directory)
+            .map_err(|error| recovery_vlog_context(error, None, None))?;
+        Ok(Self {
+            directory,
+            file_capability,
+            database_uuid,
+            geometry,
+            catalog,
+            files,
+            io,
+        })
+    }
+
+    pub(crate) fn geometry(&self) -> VLogGeometry {
+        self.geometry
+    }
+
+    pub(crate) fn database_uuid(&self) -> [u8; 16] {
+        self.database_uuid
+    }
+
+    pub(crate) fn shares_file_set(&self, files: &Arc<crate::vlog::file_set::FileSet>) -> bool {
+        Arc::ptr_eq(&self.files, files)
+    }
+
+    pub(crate) fn directory_identity(&self) -> (u64, u64) {
+        self.directory.writer_identity()
+    }
+
+    pub(crate) fn sync_accepted_range(
+        &self,
+        durable_end: Option<VLogPosition>,
+        accepted_end: Option<VLogPosition>,
+    ) -> Result<()> {
+        if durable_end == accepted_end {
+            return Ok(());
+        }
+        let accepted = accepted_end.ok_or_else(recovery_vlog_corruption)?;
+        if durable_end.is_some_and(|durable| durable >= accepted)
+            || accepted.file_id > self.geometry.max_file_id
+            || accepted.offset == 0
+            || accepted.offset > self.geometry.max_file_size
+        {
+            return Err(recovery_vlog_corruption());
+        }
+        let first_file_id = durable_end.map_or(0, |durable| durable.file_id);
+        for file_id in first_file_id..=accepted.file_id {
+            let file = self
+                .directory
+                .open_writable(&self.file_capability, file_id)
+                .map_err(|error| recovery_vlog_io(file_id, None, error))?;
+            self.catalog
+                .verify(file_id, &file)
+                .map_err(|error| recovery_vlog_context(error, Some(file_id), None))?;
+            self.io
+                .sync_file(&file)
+                .map_err(|error| recovery_vlog_io(file_id, None, error))?;
+        }
+        let created_file = durable_end.is_none_or(|durable| durable.file_id < accepted.file_id);
+        if created_file {
+            self.io
+                .sync_directory(&self.directory)
+                .map_err(recovery_vlog_directory_io)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn trim(
+        &self,
+        accepted_end: Option<VLogPosition>,
+        inventoried_file_ids: &[u32],
+    ) -> Result<()> {
+        self.files
+            .clear()
+            .map_err(|error| recovery_vlog_context(error, None, None))?;
+
+        if let Some(accepted) = accepted_end {
+            if accepted.file_id > self.geometry.max_file_id
+                || accepted.offset == 0
+                || accepted.offset > self.geometry.max_file_size
+                || inventoried_file_ids
+                    .binary_search(&accepted.file_id)
+                    .is_err()
+            {
+                return Err(recovery_vlog_corruption());
+            }
+            let file = self
+                .directory
+                .open_writable(&self.file_capability, accepted.file_id)
+                .map_err(|error| {
+                    recovery_vlog_io(accepted.file_id, Some(accepted.offset), error)
+                })?;
+            self.catalog
+                .verify(accepted.file_id, &file)
+                .map_err(|error| {
+                    recovery_vlog_context(error, Some(accepted.file_id), Some(accepted.offset))
+                })?;
+            let current_len = file
+                .metadata()
+                .map_err(|error| recovery_vlog_io(accepted.file_id, Some(accepted.offset), error))?
+                .len();
+            if current_len < accepted.offset {
+                return Err(recovery_vlog_corruption_at(
+                    accepted.file_id,
+                    Some(accepted.offset),
+                ));
+            }
+            if current_len != accepted.offset {
+                self.io
+                    .truncate_file(&file, accepted.offset)
+                    .map_err(|error| {
+                        recovery_vlog_io(accepted.file_id, Some(accepted.offset), error)
+                    })?;
+            }
+            self.io.sync_file(&file).map_err(|error| {
+                recovery_vlog_io(accepted.file_id, Some(accepted.offset), error)
+            })?;
+        }
+
+        for file_id in inventoried_file_ids
+            .iter()
+            .rev()
+            .copied()
+            .filter(|file_id| accepted_end.is_none_or(|accepted| *file_id > accepted.file_id))
+        {
+            self.io
+                .before_remove_recovery_file(file_id)
+                .map_err(|error| recovery_vlog_io(file_id, None, error))?;
+            self.directory
+                .remove_file(&self.file_capability, file_id)
+                .map_err(|error| recovery_vlog_io(file_id, None, error))?;
+            self.catalog
+                .unregister(file_id)
+                .map_err(|error| recovery_vlog_context(error, Some(file_id), None))?;
+            self.io
+                .after_remove_recovery_file(file_id)
+                .map_err(|error| recovery_vlog_io(file_id, None, error))?;
+        }
+        self.io
+            .sync_directory(&self.directory)
+            .map_err(recovery_vlog_directory_io)?;
+        self.io
+            .after_recovery_trim()
+            .map_err(recovery_vlog_directory_io)?;
+        Ok(())
+    }
+
+    pub(crate) fn into_writer(self, accepted_end: Option<VLogPosition>) -> Result<ValueLogWriter> {
+        let state = open_append_state(
+            &self.directory,
+            &self.file_capability,
+            &self.catalog,
+            self.database_uuid,
+            self.geometry,
+            accepted_end,
+        )?;
+        Ok(ValueLogWriter {
+            directory: self.directory,
+            file_capability: self.file_capability,
+            database_uuid: self.database_uuid,
+            geometry: self.geometry,
+            catalog: self.catalog,
+            state,
+            dirty: VLogDirtyState::default(),
+            pending_sync_id: None,
+            next_sync_id: 1,
+            append_failed: false,
+            last_appended: None,
+            io: self.io,
+        })
+    }
 }
 
 impl ValueLogWriter {
@@ -239,61 +464,14 @@ impl ValueLogWriter {
             .map_err(|error| open_context(error, accepted_end))?;
         let file_capability = WriterFileCapability::claim(&directory)
             .map_err(|error| open_context(error, accepted_end))?;
-        let state = match accepted_end {
-            None => {
-                if !catalog
-                    .file_ids()
-                    .map_err(|error| open_context(error, None))?
-                    .is_empty()
-                {
-                    return Err(open_context(append_layout(0, 0), None));
-                }
-                AppendState::Empty
-            }
-            Some(position) => {
-                if LayoutPlanner::from_position(geometry, position).is_err() {
-                    return Err(open_context(
-                        append_layout(position.file_id, position.offset),
-                        Some(position),
-                    ));
-                }
-                if position.offset == 0 {
-                    return Err(open_context(
-                        append_layout(position.file_id, position.offset),
-                        Some(position),
-                    ));
-                }
-                let file = directory
-                    .open_writable(&file_capability, position.file_id)
-                    .map_err(|error| open_io(position.file_id, position.offset, error))?;
-                catalog
-                    .verify(position.file_id, &file)
-                    .map_err(|error| open_context(error, Some(position)))?;
-                let len = file
-                    .metadata()
-                    .map_err(|error| open_io(position.file_id, position.offset, error))?
-                    .len();
-                if len != position.offset {
-                    return Err(open_context(
-                        append_layout(position.file_id, position.offset),
-                        Some(position),
-                    ));
-                }
-                validate_accepted_catalog(&directory, &catalog, database_uuid, geometry, position)?;
-                if position.offset == geometry.max_file_size {
-                    drop(file);
-                    AppendState::AtFileLimit {
-                        last_file_id: position.file_id,
-                    }
-                } else {
-                    AppendState::Open {
-                        file_id: position.file_id,
-                        offset: position.offset,
-                        file,
-                    }
-                }
-            }
-        };
+        let state = open_append_state(
+            &directory,
+            &file_capability,
+            &catalog,
+            database_uuid,
+            geometry,
+            accepted_end,
+        )?;
         Ok(Self {
             directory,
             file_capability,
@@ -868,6 +1046,65 @@ fn validate_writer_identity(database_uuid: [u8; 16], geometry: VLogGeometry) -> 
     Ok(())
 }
 
+fn open_append_state(
+    directory: &VLogDirectory,
+    file_capability: &WriterFileCapability,
+    catalog: &FileCatalog,
+    database_uuid: [u8; 16],
+    geometry: VLogGeometry,
+    accepted_end: Option<VLogPosition>,
+) -> Result<AppendState> {
+    match accepted_end {
+        None => {
+            if !catalog
+                .file_ids()
+                .map_err(|error| open_context(error, None))?
+                .is_empty()
+            {
+                return Err(open_context(append_layout(0, 0), None));
+            }
+            Ok(AppendState::Empty)
+        }
+        Some(position) => {
+            if LayoutPlanner::from_position(geometry, position).is_err() || position.offset == 0 {
+                return Err(open_context(
+                    append_layout(position.file_id, position.offset),
+                    Some(position),
+                ));
+            }
+            let file = directory
+                .open_writable(file_capability, position.file_id)
+                .map_err(|error| open_io(position.file_id, position.offset, error))?;
+            catalog
+                .verify(position.file_id, &file)
+                .map_err(|error| open_context(error, Some(position)))?;
+            let len = file
+                .metadata()
+                .map_err(|error| open_io(position.file_id, position.offset, error))?
+                .len();
+            if len != position.offset {
+                return Err(open_context(
+                    append_layout(position.file_id, position.offset),
+                    Some(position),
+                ));
+            }
+            validate_accepted_catalog(directory, catalog, database_uuid, geometry, position)?;
+            if position.offset == geometry.max_file_size {
+                drop(file);
+                Ok(AppendState::AtFileLimit {
+                    last_file_id: position.file_id,
+                })
+            } else {
+                Ok(AppendState::Open {
+                    file_id: position.file_id,
+                    offset: position.offset,
+                    file,
+                })
+            }
+        }
+    }
+}
+
 fn validate_accepted_catalog(
     directory: &VLogDirectory,
     catalog: &FileCatalog,
@@ -1028,6 +1265,68 @@ fn writer_claim_busy() -> StorageError {
         None,
         RetryAdvice::RetrySameInstance,
     )
+}
+
+fn recovery_vlog_context(
+    mut error: StorageError,
+    file_id: Option<u32>,
+    offset: Option<u64>,
+) -> StorageError {
+    error.operation = Operation::Open;
+    error.protocol_stage = ProtocolStage::Recovery;
+    error.write_outcome = None;
+    error.instance_state = None;
+    error.vlog_file_id = file_id;
+    error.vlog_offset = offset;
+    error
+}
+
+fn recovery_vlog_corruption() -> StorageError {
+    StorageError::codec_error(
+        StorageErrorKind::Corruption,
+        Operation::Open,
+        ProtocolStage::Recovery,
+        None,
+        RetryAdvice::RestoreOrRepair,
+    )
+}
+
+fn recovery_vlog_corruption_at(file_id: u32, offset: Option<u64>) -> StorageError {
+    let mut error = recovery_vlog_corruption();
+    error.vlog_file_id = Some(file_id);
+    error.vlog_offset = offset;
+    error
+}
+
+fn recovery_vlog_io(file_id: u32, offset: Option<u64>, source: io::Error) -> StorageError {
+    if source.kind() == io::ErrorKind::NotFound || source.raw_os_error() == Some(ELOOP) {
+        let mut error = recovery_vlog_corruption_at(file_id, offset);
+        error.os_code = source.raw_os_error();
+        return error;
+    }
+    let mut error = StorageError::codec_error(
+        StorageErrorKind::Io,
+        Operation::Open,
+        ProtocolStage::Recovery,
+        None,
+        RetryAdvice::FixEnvironmentAndReopen,
+    );
+    error.os_code = source.raw_os_error();
+    error.vlog_file_id = Some(file_id);
+    error.vlog_offset = offset;
+    error
+}
+
+fn recovery_vlog_directory_io(source: io::Error) -> StorageError {
+    let mut error = StorageError::codec_error(
+        StorageErrorKind::Io,
+        Operation::Open,
+        ProtocolStage::Recovery,
+        None,
+        RetryAdvice::FixEnvironmentAndReopen,
+    );
+    error.os_code = source.raw_os_error();
+    error
 }
 
 fn append_io(

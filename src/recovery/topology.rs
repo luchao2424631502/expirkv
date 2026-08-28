@@ -1,7 +1,11 @@
 //! Managed-file inventory, identity, and physical-topology validation.
 #![allow(dead_code)] // Stage 7 inventory; later recovery stages consume the result.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::fs;
+#[cfg(test)]
+use std::io;
 use std::io::Read;
 
 use crate::commit::{DurableVLogEnd, VLogPos};
@@ -22,6 +26,27 @@ const VLOG_DIRECTORY_NAME: &str = "vlog";
 const VLOG_PREFIX_LEN: usize = 1;
 const VLOG_DIGITS_LEN: usize = 6;
 const VLOG_SUFFIX: &str = ".data";
+
+#[cfg(test)]
+std::thread_local! {
+    static FAIL_NEXT_INVENTORY_INSPECT: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_inventory_inspect_for_test() {
+    FAIL_NEXT_INVENTORY_INSPECT.with(|armed| armed.set(true));
+}
+
+fn inject_inventory_inspect_failure() -> Result<()> {
+    #[cfg(test)]
+    if FAIL_NEXT_INVENTORY_INSPECT.with(|armed| armed.replace(false)) {
+        return Err(open_io_error(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "injected inventory inspection failure",
+        )));
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PhysicalTail {
@@ -99,10 +124,21 @@ impl RecoveryTopology {
             }),
         }
     }
+
+    pub(crate) fn physical_tail_matches(&self, end: DurableVLogEnd) -> bool {
+        match (self.physical_tail, end) {
+            (PhysicalTail::Empty, DurableVLogEnd::Empty) => true,
+            (PhysicalTail::Position(actual), DurableVLogEnd::Position(expected)) => {
+                actual == expected
+            }
+            _ => false,
+        }
+    }
 }
 
 impl ManagedInventory {
     pub(crate) fn inspect(root: &RootLock, format: &FormatMetadataV0) -> Result<Self> {
+        inject_inventory_inspect_failure()?;
         require_regular(root, LOCK_FILE_NAME, None)?;
         require_regular(root, FORMAT_FILE_NAME, Some(FORMAT_ENCODED_LEN as u64))?;
         if !matches!(
