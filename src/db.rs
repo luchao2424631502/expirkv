@@ -1,14 +1,23 @@
 //! Database lifecycle, public API implementation, and component assembly.
-#![allow(dead_code)] // Stage 7 Open preparation; public assembly is added later.
+#![allow(dead_code)] // Test-only stage harnesses use selected preparation helpers.
 
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+#[cfg(not(test))]
+use crate::WriteOutcome;
+#[cfg(not(test))]
+use crate::commit::{
+    CommitCoordinator, DurableVLogEnd, OsTxUuidSource, preflight_batch, preflight_delete,
+    preflight_put,
+};
 use crate::format::{
     FORMAT_ENCODED_LEN, FORMAT_FILE_NAME, FORMAT_TEMP_FILE_NAME, FormatMetadataV0,
 };
+#[cfg(not(test))]
+use crate::index::LateBoundFjallBackend;
 #[cfg(test)]
 use crate::index::TestCommitFailure;
 use crate::index::{
@@ -21,6 +30,20 @@ use crate::lock::{
     ManagedEntryKind, RootLock, invalid_argument_error, layout_error, not_found_error,
     open_io_error, sync_directory_tree_nofollow, sync_file_data,
 };
+#[cfg(not(test))]
+use crate::recovery::{analyze_recovery, execute_recovery};
+#[cfg(not(test))]
+use crate::runtime::{ExternalLease, LifecycleController, OperationGuard, RuntimeControl};
+#[cfg(not(test))]
+use crate::stats::StatsState;
+#[cfg(not(test))]
+use crate::vlog::file_set::{FileCatalog, FileSet, VLogDirectory};
+#[cfg(not(test))]
+use crate::vlog::format::{VLogGeometry, VLogPosition};
+#[cfg(not(test))]
+use crate::vlog::reader::ValueLogReader;
+#[cfg(not(test))]
+use crate::vlog::writer::ValueLogRecovery;
 use crate::{
     DbIterator, DbStats, InstanceState, KeyRange, Operation, Options, ProtocolStage, RangeCursor,
     ReadOptions, Result, RetryAdvice, Snapshot, StorageError, StorageErrorKind, WriteBatch,
@@ -603,8 +626,26 @@ struct ReadPath {
     values: Arc<dyn ValueReader>,
 }
 
+#[cfg(not(test))]
+type LiveCommitCoordinator = CommitCoordinator<LateBoundFjallBackend, OsTxUuidSource>;
+
+#[cfg(not(test))]
+struct LiveComponents {
+    // The lifecycle controller closes admission before protocol resources are
+    // released. RootLock remains last and therefore outlives every component.
+    lifecycle: Arc<LifecycleController>,
+    runtime: Arc<RuntimeControl>,
+    coordinator: Arc<LiveCommitCoordinator>,
+    _options: Arc<Options>,
+    _root_lock: RootLock,
+}
+
 pub(crate) struct DbInner {
+    // Read-only Arcs are released before the live protocol components. The
+    // final RootLock is owned by LiveComponents and is always released last.
     read_path: ReadPath,
+    #[cfg(not(test))]
+    live: LiveComponents,
 }
 
 impl DbInner {
@@ -781,12 +822,34 @@ fn poisoned_read_error() -> StorageError {
     )
 }
 
-#[derive(Clone)]
 pub struct Db {
+    // Field order is intentional: the external lease closes admission before
+    // the final Arc can release DbInner and its root lock.
+    #[cfg(not(test))]
+    lease: ExternalLease,
     inner: Arc<DbInner>,
 }
 
+impl Clone for Db {
+    fn clone(&self) -> Self {
+        Self {
+            #[cfg(not(test))]
+            lease: self.lease.clone(),
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+#[cfg(not(test))]
+struct PublicOperationGuard {
+    // Drop the lifecycle guard before releasing the Arc that keeps all storage
+    // resources and the root lock alive for the operation.
+    _operation: OperationGuard,
+    _inner: Arc<DbInner>,
+}
+
 impl Db {
+    #[cfg(test)]
     pub(crate) fn from_read_components<R, I, V>(
         runtime: Arc<R>,
         index: Arc<I>,
@@ -808,6 +871,95 @@ impl Db {
         }
     }
 
+    #[cfg(not(test))]
+    pub fn open(options: &Options, path: impl AsRef<Path>) -> Result<Self> {
+        let preparation = prepare_open(options, path.as_ref())?;
+        let OpenPreparation {
+            index: recovery_index,
+            inventory,
+            format,
+            root_lock,
+        } = preparation;
+
+        let vlog_path = root_lock.canonical_path().join(VLOG_DIRECTORY_NAME);
+        let directory = Arc::new(VLogDirectory::open(&vlog_path).map_err(open_recovery_error)?);
+        let catalog = Arc::new(FileCatalog::new());
+        register_inventory(&directory, &catalog, &inventory)?;
+        let files = Arc::new(
+            FileSet::new(
+                directory,
+                format.database_uuid,
+                VLogGeometry::PRODUCTION,
+                catalog,
+                options.vlog_read_handle_cache_capacity,
+            )
+            .map_err(open_recovery_error)?,
+        );
+        let reader = Arc::new(
+            ValueLogReader::new(Arc::clone(&files), VLogGeometry::PRODUCTION)
+                .map_err(open_recovery_error)?,
+        );
+        let plan = analyze_recovery(&recovery_index, &format, &inventory, &reader)?;
+        let recovery = ValueLogRecovery::new(Arc::clone(&files)).map_err(open_recovery_error)?;
+        let recovered = execute_recovery(
+            &recovery_index,
+            plan,
+            &root_lock,
+            &format,
+            &reader,
+            recovery,
+        )?;
+
+        let index_path = root_lock.canonical_path().join(INDEX_DIRECTORY_NAME);
+        let stats = Arc::new(StatsState::new());
+        let runtime = RuntimeControl::new(Arc::clone(&stats));
+        let head_vlog_end = durable_end_position(recovered.durable_frontier.durable_vlog_end);
+        let index_binding = Arc::new(LateBoundFjallBackend::new());
+        let coordinator = Arc::new(CommitCoordinator::new(
+            Arc::clone(&runtime),
+            stats,
+            Arc::clone(&index_binding),
+            recovered.writer,
+            OsTxUuidSource,
+            recovered.head_seq,
+            recovered.durable_frontier,
+            head_vlog_end,
+        )?);
+        let (lifecycle, lease) = LifecycleController::new_with_external_lease();
+        let read_path = ReadPath {
+            runtime: Arc::clone(&runtime) as Arc<dyn ReadRuntime>,
+            index: Arc::clone(&index_binding) as Arc<dyn UserIndexReader>,
+            values: reader as Arc<dyn ValueReader>,
+        };
+        let inner = Arc::new(DbInner {
+            read_path,
+            live: LiveComponents {
+                lifecycle,
+                runtime,
+                coordinator,
+                _options: Arc::new(copy_options(options)),
+                _root_lock: root_lock,
+            },
+        });
+
+        // Recovery and the complete Healthy runtime are now assembled against
+        // the one-shot index binding. Only at this point may Fjall start its
+        // flush/compaction workers. The binding is published before `Db`
+        // escapes, so public requests cannot observe the unbound state.
+        drop(recovery_index);
+        let index = Arc::new(FjallBackend::open_existing(
+            &index_path,
+            options.fjall_index_options(),
+        )?);
+        validate_final_identity(&index, &format)?;
+        index_binding
+            .bind(index)
+            .map_err(|_| late_bound_index_error())?;
+
+        Ok(Self { lease, inner })
+    }
+
+    #[cfg(test)]
     pub fn open(options: &Options, path: impl AsRef<Path>) -> Result<Self> {
         let _ = (options, path.as_ref());
         Err(StorageError::unsupported(
@@ -817,6 +969,18 @@ impl Db {
         ))
     }
 
+    #[cfg(not(test))]
+    pub fn put(&self, options: &WriteOptions, key: &[u8], value: &[u8]) -> Result<()> {
+        let _operation = self.begin_operation(Operation::Put)?;
+        self.inner
+            .live
+            .runtime
+            .check_write_admission(Operation::Put)?;
+        let write = preflight_put(key, value, options.sync)?;
+        self.inner.live.coordinator.commit_nonempty(&write)
+    }
+
+    #[cfg(test)]
     pub fn put(&self, options: &WriteOptions, key: &[u8], value: &[u8]) -> Result<()> {
         let _ = (options, key, value);
         Err(self
@@ -825,9 +989,23 @@ impl Db {
     }
 
     pub fn get(&self, options: &ReadOptions<'_>, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        #[cfg(not(test))]
+        let _operation = self.begin_operation(Operation::Get)?;
         self.inner.get(options, key)
     }
 
+    #[cfg(not(test))]
+    pub fn delete(&self, options: &WriteOptions, key: &[u8]) -> Result<()> {
+        let _operation = self.begin_operation(Operation::Delete)?;
+        self.inner
+            .live
+            .runtime
+            .check_write_admission(Operation::Delete)?;
+        let write = preflight_delete(key, options.sync)?;
+        self.inner.live.coordinator.commit_nonempty(&write)
+    }
+
+    #[cfg(test)]
     pub fn delete(&self, options: &WriteOptions, key: &[u8]) -> Result<()> {
         let _ = (options, key);
         Err(self
@@ -835,6 +1013,21 @@ impl Db {
             .unsupported_error(Operation::Delete, ProtocolStage::Preflight))
     }
 
+    #[cfg(not(test))]
+    pub fn write(&self, options: &WriteOptions, batch: &WriteBatch) -> Result<()> {
+        let _operation = self.begin_operation(Operation::WriteBatch)?;
+        if batch.is_empty() {
+            return self.inner.live.coordinator.commit_empty_batch(options.sync);
+        }
+        self.inner
+            .live
+            .runtime
+            .check_write_admission(Operation::WriteBatch)?;
+        let write = preflight_batch(batch, options.sync)?;
+        self.inner.live.coordinator.commit_nonempty(&write)
+    }
+
+    #[cfg(test)]
     pub fn write(&self, options: &WriteOptions, batch: &WriteBatch) -> Result<()> {
         let _ = (options, batch);
         Err(self
@@ -843,12 +1036,16 @@ impl Db {
     }
 
     pub fn snapshot(&self) -> Result<Snapshot> {
+        #[cfg(not(test))]
+        let _operation = self.begin_operation(Operation::Snapshot)?;
         Err(self
             .inner
             .unsupported_error(Operation::Snapshot, ProtocolStage::Read))
     }
 
     pub fn iter(&self, options: &ReadOptions<'_>) -> Result<DbIterator> {
+        #[cfg(not(test))]
+        let _operation = self.begin_operation(Operation::Iterator)?;
         let _ = options;
         Err(self
             .inner
@@ -861,6 +1058,8 @@ impl Db {
         range: KeyRange<'_>,
         limit: usize,
     ) -> Result<RangeCursor> {
+        #[cfg(not(test))]
+        let _operation = self.begin_operation(Operation::Range)?;
         let _ = (options, range, limit);
         Err(self
             .inner
@@ -879,4 +1078,112 @@ impl Db {
             None,
         ))
     }
+
+    #[cfg(not(test))]
+    fn begin_operation(&self, operation: Operation) -> Result<PublicOperationGuard> {
+        let operation_guard = self
+            .inner
+            .live
+            .lifecycle
+            .acquire_operation()
+            .ok_or_else(|| lifecycle_admission_error(operation, self.inner.instance_state()))?;
+        Ok(PublicOperationGuard {
+            _operation: operation_guard,
+            _inner: Arc::clone(&self.inner),
+        })
+    }
+}
+
+#[cfg(not(test))]
+fn register_inventory(
+    directory: &Arc<VLogDirectory>,
+    catalog: &Arc<FileCatalog>,
+    inventory: &ManagedInventory,
+) -> Result<()> {
+    for entry in &inventory.vlog_files {
+        let file = directory
+            .open_read_only(entry.file_id)
+            .map_err(|error| inventory_file_error(error, entry.file_id))?;
+        let len = file
+            .metadata()
+            .map_err(|error| inventory_file_error(error, entry.file_id))?
+            .len();
+        if len != entry.len {
+            return Err(inventory_corruption(entry.file_id));
+        }
+        catalog
+            .register(entry.file_id, &file)
+            .map_err(open_recovery_error)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn inventory_file_error(error: io::Error, file_id: u32) -> StorageError {
+    let mut error = open_recovery_error(open_io_error(error));
+    error.vlog_file_id = Some(file_id);
+    error
+}
+
+#[cfg(not(test))]
+fn inventory_corruption(file_id: u32) -> StorageError {
+    let mut error = metadata_error(StorageErrorKind::Corruption);
+    error.vlog_file_id = Some(file_id);
+    error
+}
+
+#[cfg(not(test))]
+fn durable_end_position(end: DurableVLogEnd) -> Option<VLogPosition> {
+    match end {
+        DurableVLogEnd::Empty => None,
+        DurableVLogEnd::Position(position) => Some(VLogPosition {
+            file_id: position.file_id,
+            offset: position.offset,
+        }),
+    }
+}
+
+#[cfg(not(test))]
+fn copy_options(options: &Options) -> Options {
+    Options {
+        create_if_missing: options.create_if_missing,
+        error_if_exists: options.error_if_exists,
+        write_buffer_size: options.write_buffer_size,
+        max_open_files: options.max_open_files,
+        block_cache_size: options.block_cache_size,
+        block_size: options.block_size,
+        block_restart_interval: options.block_restart_interval,
+        max_file_size: options.max_file_size,
+        compression: options.compression,
+        vlog_read_handle_cache_capacity: options.vlog_read_handle_cache_capacity,
+    }
+}
+
+#[cfg(not(test))]
+fn lifecycle_admission_error(operation: Operation, state: InstanceState) -> StorageError {
+    let write_outcome = matches!(
+        operation,
+        Operation::Put | Operation::Delete | Operation::WriteBatch | Operation::Sync
+    )
+    .then_some(WriteOutcome::NotCommitted);
+    let mut error = StorageError::codec_error(
+        StorageErrorKind::StoragePoisoned,
+        operation,
+        ProtocolStage::Admission,
+        write_outcome,
+        RetryAdvice::ReopenAndVerify,
+    );
+    error.instance_state = Some(state);
+    error
+}
+
+#[cfg(not(test))]
+fn late_bound_index_error() -> StorageError {
+    StorageError::codec_error(
+        StorageErrorKind::StoragePoisoned,
+        Operation::Open,
+        ProtocolStage::Lifecycle,
+        None,
+        RetryAdvice::ReopenAndVerify,
+    )
 }

@@ -104,6 +104,14 @@ where
         lock(&self.writer).dirty_state().clone()
     }
 
+    #[cfg(test)]
+    pub(crate) fn publish_head_behind_durable_for_test(&self) {
+        let mut state = lock(&self.state);
+        state.durable_frontier.durable_seq = state.head_seq.saturating_add(1);
+        drop(state);
+        self.publish_stats();
+    }
+
     fn commit_started(&self, write: &ValidatedWrite<'_>, sync: bool) -> Result<()> {
         let operation = write.public_operation();
         let ticket = self.start_request(operation)?;
@@ -300,14 +308,17 @@ where
         let state = *lock(&self.state);
         let writer = lock(&self.writer);
         let durable_end = descriptor_end_to_format(state.durable_frontier.durable_vlog_end);
-        self.stats.update_commit_state(
+        if !self.stats.update_commit_state(
             state.head_seq,
             state.durable_frontier.durable_seq,
             durable_end.map(|position| (position.file_id, position.offset)),
             writer.active_file_id(),
             writer.file_count(),
             writer.logical_bytes(),
-        );
+        ) {
+            self.runtime
+                .latch_failure(InstanceState::Poisoned, &stats_invariant_error());
+        }
     }
 
     fn fail_started(
@@ -519,6 +530,18 @@ fn retry_for_state(error: &StorageError, state: InstanceState) -> RetryAdvice {
         }
         InstanceState::Poisoned => RetryAdvice::ReopenAndVerify,
     }
+}
+
+fn stats_invariant_error() -> StorageError {
+    let mut error = StorageError::codec_error(
+        StorageErrorKind::Corruption,
+        Operation::Background,
+        ProtocolStage::Maintenance,
+        None,
+        RetryAdvice::RestoreOrRepair,
+    );
+    error.instance_state = Some(InstanceState::Poisoned);
+    error
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {

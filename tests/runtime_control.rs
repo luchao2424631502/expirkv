@@ -25,6 +25,22 @@ fn runtime() -> Arc<RuntimeControl> {
     RuntimeControl::new(Arc::new(StatsState::new()))
 }
 
+#[test]
+fn stats_rejects_head_behind_durable_without_publishing_a_saturated_snapshot() {
+    let stats = StatsState::new();
+    assert!(stats.update_commit_state(7, 5, Some((2, 4096)), Some(2), 3, 12_345));
+    let before = stats.snapshot();
+    assert_eq!(before.durability_lag, 2);
+
+    assert!(!stats.update_commit_state(4, 5, Some((3, 8192)), Some(3), 4, 99_999));
+    let after = stats.snapshot();
+    assert_eq!(after.head_seq, before.head_seq);
+    assert_eq!(after.durable_seq, before.durable_seq);
+    assert_eq!(after.durability_lag, before.durability_lag);
+    assert_eq!(after.vlog_file_count, before.vlog_file_count);
+    assert_eq!(after.vlog_logical_bytes, before.vlog_logical_bytes);
+}
+
 fn join_before_deadline(handle: thread::JoinHandle<()>, deadline: Instant, label: &str) {
     while !handle.is_finished() {
         assert!(

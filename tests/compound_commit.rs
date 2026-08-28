@@ -396,6 +396,28 @@ impl FakeHarness {
     }
 }
 
+#[test]
+fn invalid_head_behind_durable_poisons_runtime_without_saturating_stats() -> TestResult {
+    let harness = FakeHarness::new(WriteFailure::None)?;
+    let before = harness.stats.snapshot();
+
+    harness.coordinator.publish_head_behind_durable_for_test();
+
+    let after = harness.runtime.stats();
+    assert_eq!(after.instance_state, InstanceState::Poisoned);
+    assert_eq!(after.head_seq, before.head_seq);
+    assert_eq!(after.durable_seq, before.durable_seq);
+    assert_eq!(after.durability_lag, before.durability_lag);
+    assert_eq!(
+        after
+            .first_latched_error
+            .expect("stats invariant error")
+            .kind,
+        StorageErrorKind::Corruption
+    );
+    Ok(())
+}
+
 struct RealCommitHarness {
     _temporary: TempDir,
     backend: Arc<FjallBackend>,

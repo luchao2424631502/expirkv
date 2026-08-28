@@ -7,6 +7,7 @@ use rustkv::{
     RangeCursor, ReadOptions, Result, RetryAdvice, Snapshot, StorageError, StorageErrorKind,
     VLogPosition, WriteBatch, WriteOptions, WriteOutcome,
 };
+use tempfile::TempDir;
 
 fn assert_clone_send_sync<T: Clone + Send + Sync>() {}
 fn assert_error<T: Error>() {}
@@ -245,18 +246,20 @@ fn errors_do_not_copy_user_bytes_into_public_text_or_source() {
 }
 
 #[test]
-fn delayed_static_database_operations_return_unsupported_without_io() {
+fn open_reports_missing_and_delayed_destroy_remains_unsupported() {
     let options = Options::default();
-    let open_error = match Db::open(&options, Path::new("stage-1-does-not-open")) {
-        Ok(_) => panic!("stage 1 must not create a database"),
+    let folder = TempDir::new().unwrap();
+    let missing_path = folder.path().join("missing-db");
+    let open_error = match Db::open(&options, &missing_path) {
+        Ok(_) => panic!("open must not create a database without create_if_missing"),
         Err(error) => error,
     };
-    assert_eq!(open_error.kind, StorageErrorKind::Unsupported);
+    assert_eq!(open_error.kind, StorageErrorKind::NotFound);
     assert_eq!(open_error.operation, Operation::Open);
     assert_eq!(open_error.write_outcome, None);
     assert_eq!(open_error.instance_state, None);
 
-    let destroy_error = match Db::destroy(Path::new("stage-1-does-not-destroy"), &options) {
+    let destroy_error = match Db::destroy(Path::new(&missing_path), &options) {
         Ok(()) => panic!("stage 1 must not report a fake destroy success"),
         Err(error) => error,
     };

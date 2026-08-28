@@ -4,6 +4,7 @@ use std::error::Error;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fjall::{Database, KeyspaceCreateOptions};
@@ -85,6 +86,26 @@ fn initialize(backend: &FjallBackend, uuid_byte: u8) -> Vec<u8> {
         .commit_atomic(batch, IndexCommitMode::SyncAll)
         .unwrap();
     identity
+}
+
+#[test]
+fn late_bound_backend_is_unusable_until_exactly_one_final_backend_is_published() -> TestResult {
+    let binding = LateBoundFjallBackend::new();
+    let unbound = binding.get_database_identity().unwrap_err();
+    assert_eq!(unbound.kind, StorageErrorKind::StoragePoisoned);
+
+    let folder = TempDir::new()?;
+    let backend = Arc::new(FjallBackend::create(
+        &folder.path().join("index"),
+        default_index_options(),
+    )?);
+    let identity = initialize(&backend, 0x4a);
+    binding
+        .bind(Arc::clone(&backend))
+        .map_err(|_| io::Error::other("first late binding was rejected"))?;
+    assert_eq!(binding.get_database_identity()?, Some(identity));
+    assert!(binding.bind(backend).is_err());
+    Ok(())
 }
 
 fn encoded_pointer(file_id: u32, value_len: u16) -> Vec<u8> {

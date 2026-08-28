@@ -596,6 +596,108 @@ pub(crate) trait IndexBackend: Send + Sync {
 mod fjall;
 
 pub(crate) type FjallBackend = fjall::FjallBackend;
+
+/// Runtime index capability assembled before Fjall background workers start.
+///
+/// Fjall 3.1.8 starts its worker pool inside `Database::open` and does not
+/// expose a separate activation method. `Db::open` therefore builds every
+/// component that depends on the index against this one-shot binding, then
+/// opens the worker-enabled Fjall handle and publishes it here before the
+/// public `Db` can escape.
+pub(crate) struct LateBoundFjallBackend {
+    backend: std::sync::OnceLock<std::sync::Arc<FjallBackend>>,
+}
+
+impl LateBoundFjallBackend {
+    pub(crate) fn new() -> Self {
+        Self {
+            backend: std::sync::OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn bind(
+        &self,
+        backend: std::sync::Arc<FjallBackend>,
+    ) -> std::result::Result<(), std::sync::Arc<FjallBackend>> {
+        self.backend.set(backend)
+    }
+
+    fn backend(
+        &self,
+        operation: Operation,
+        protocol_stage: ProtocolStage,
+    ) -> Result<&FjallBackend> {
+        self.backend
+            .get()
+            .map(std::sync::Arc::as_ref)
+            .ok_or_else(|| late_bound_backend_error(operation, protocol_stage))
+    }
+}
+
+impl IndexBackend for LateBoundFjallBackend {
+    type Snapshot = <FjallBackend as IndexBackend>::Snapshot;
+    type UserIterator = <FjallBackend as IndexBackend>::UserIterator;
+    type InternalIterator = <FjallBackend as IndexBackend>::InternalIterator;
+
+    fn commit_atomic(
+        &self,
+        batch: IndexAtomicBatch,
+        mode: IndexCommitMode,
+    ) -> std::result::Result<(), IndexCommitError> {
+        let backend = self.backend.get().ok_or_else(|| {
+            IndexCommitError::not_applied(InternalIndexError::new(
+                StorageErrorKind::StoragePoisoned,
+                None,
+            ))
+        })?;
+        backend.commit_atomic(batch, mode)
+    }
+
+    fn get_database_identity(&self) -> Result<Option<Vec<u8>>> {
+        self.backend(Operation::Open, ProtocolStage::Preflight)?
+            .get_database_identity()
+    }
+
+    fn get_user(&self, key: &[u8], snapshot: Option<&Self::Snapshot>) -> Result<Option<Vec<u8>>> {
+        self.backend(Operation::Get, ProtocolStage::Read)?
+            .get_user(key, snapshot)
+    }
+
+    fn get_internal(&self, space: InternalIndexSpace, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.backend(Operation::Recovery, ProtocolStage::Recovery)?
+            .get_internal(space, key)
+    }
+
+    fn scan_internal(
+        &self,
+        space: InternalIndexSpace,
+        range: InternalKeyRange,
+    ) -> Result<Self::InternalIterator> {
+        self.backend(Operation::Recovery, ProtocolStage::Recovery)?
+            .scan_internal(space, range)
+    }
+
+    fn snapshot(&self) -> Result<Self::Snapshot> {
+        self.backend(Operation::Snapshot, ProtocolStage::Read)?
+            .snapshot()
+    }
+
+    fn iter_user(&self, snapshot: Option<&Self::Snapshot>) -> Result<Self::UserIterator> {
+        self.backend(Operation::Iterator, ProtocolStage::Read)?
+            .iter_user(snapshot)
+    }
+}
+
+fn late_bound_backend_error(operation: Operation, protocol_stage: ProtocolStage) -> StorageError {
+    StorageError::codec_error(
+        StorageErrorKind::StoragePoisoned,
+        operation,
+        protocol_stage,
+        None,
+        RetryAdvice::ReopenAndVerify,
+    )
+}
+
 #[cfg(test)]
 #[allow(unused_imports)]
 // Included source modules expose only the helpers each test crate uses.
