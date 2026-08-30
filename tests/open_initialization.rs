@@ -7,11 +7,13 @@ pub(crate) use error::{
     WriteOutcome,
 };
 
-pub struct Snapshot;
-pub struct DbIterator;
-pub struct RangeCursor;
 pub struct WriteBatch;
-pub struct KeyRange<'a>(std::marker::PhantomData<&'a ()>);
+#[path = "../src/snapshot.rs"]
+mod snapshot;
+pub(crate) use snapshot::Snapshot;
+#[path = "../src/cursor.rs"]
+mod cursor;
+pub(crate) use cursor::{DbIterator, KeyRange, RangeCursor};
 
 #[path = "../src/stats.rs"]
 mod stats;

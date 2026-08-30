@@ -22,9 +22,9 @@ use crate::index::LateBoundFjallBackend;
 use crate::index::TestCommitFailure;
 use crate::index::{
     DATABASE_IDENTITY_KEY, DURABLE_FRONTIER_KEY, DatabaseIdentityV0, FjallBackend, HEAD_SEQ_KEY,
-    IndexApplyState, IndexBackend, IndexCommitError, IndexCommitMode, InternalIndexError,
-    InternalIndexSpace, InternalKeyRange, initialization_batch, is_encoded_empty_durable_frontier,
-    is_encoded_head_seq_zero,
+    IndexApplyState, IndexBackend, IndexCommitError, IndexCommitMode, IndexEntry,
+    InternalIndexError, InternalIndexSpace, InternalKeyRange, initialization_batch,
+    is_encoded_empty_durable_frontier, is_encoded_head_seq_zero,
 };
 use crate::lock::{
     ManagedEntryKind, RootLock, invalid_argument_error, layout_error, not_found_error,
@@ -608,11 +608,53 @@ pub(crate) trait ReadRuntime: Send + Sync {
 
 pub(crate) trait UserIndexReader: Send + Sync {
     fn get_user_pointer(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
+
+    fn snapshot_view(self: Arc<Self>) -> Result<Arc<dyn UserIndexSnapshot>> {
+        let _ = self;
+        Err(StorageError::unsupported(
+            Operation::Snapshot,
+            ProtocolStage::Read,
+            None,
+        ))
+    }
 }
 
-impl<T: IndexBackend> UserIndexReader for T {
+pub(crate) type UserIndexIterator = Box<dyn DoubleEndedIterator<Item = Result<IndexEntry>> + Send>;
+
+pub(crate) trait UserIndexSnapshot: Send + Sync {
+    fn get_user_pointer(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
+
+    fn iter_user(&self) -> Result<UserIndexIterator>;
+}
+
+struct BackendIndexSnapshot<T: IndexBackend> {
+    backend: Arc<T>,
+    snapshot: T::Snapshot,
+}
+
+impl<T: IndexBackend + 'static> UserIndexSnapshot for BackendIndexSnapshot<T> {
+    fn get_user_pointer(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.backend.get_user(key, Some(&self.snapshot))
+    }
+
+    fn iter_user(&self) -> Result<UserIndexIterator> {
+        self.backend
+            .iter_user(Some(&self.snapshot))
+            .map(|iterator| Box::new(iterator) as UserIndexIterator)
+    }
+}
+
+impl<T: IndexBackend + 'static> UserIndexReader for T {
     fn get_user_pointer(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.get_user(key, None)
+    }
+
+    fn snapshot_view(self: Arc<Self>) -> Result<Arc<dyn UserIndexSnapshot>> {
+        let snapshot = self.snapshot()?;
+        Ok(Arc::new(BackendIndexSnapshot {
+            backend: self,
+            snapshot,
+        }))
     }
 }
 
@@ -661,15 +703,8 @@ impl DbInner {
         StorageError::unsupported(operation, protocol_stage, Some(self.instance_state()))
     }
 
-    fn get(&self, options: &ReadOptions<'_>, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let started = self.begin_read()?;
-        if options.snapshot.is_some() {
-            return Err(StorageError::unsupported(
-                Operation::Get,
-                ProtocolStage::Read,
-                Some(started.instance_state),
-            ));
-        }
+    fn get(self: &Arc<Self>, options: &ReadOptions<'_>, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let started = self.begin_read(Operation::Get)?;
         if key.is_empty() || key.len() > MAX_KEY_VALUE_SIZE {
             return Err(StorageError::read_error(
                 StorageErrorKind::InvalidArgument,
@@ -678,12 +713,35 @@ impl DbInner {
             ));
         }
 
-        let encoded_pointer = match self.read_path.index.get_user_pointer(key) {
+        let index_view = match options.snapshot {
+            Some(snapshot) => {
+                if !snapshot.belongs_to(self) {
+                    return Err(invalid_read_argument(
+                        Operation::Get,
+                        started.instance_state,
+                    ));
+                }
+                Some(snapshot.view())
+            }
+            None => None,
+        };
+
+        let pointer_result = match index_view.as_ref() {
+            Some(view) => view.get_user_pointer(key),
+            None => self.read_path.index.get_user_pointer(key),
+        };
+        let encoded_pointer = match pointer_result {
             Ok(pointer) => pointer,
-            Err(error) => return Err(self.handle_read_failure(error, ReadFailureDomain::Index)),
+            Err(error) => {
+                return Err(self.handle_read_failure(
+                    error,
+                    ReadFailureDomain::Index,
+                    Operation::Get,
+                ));
+            }
         };
         let Some(encoded_pointer) = encoded_pointer else {
-            self.complete_read(started)?;
+            self.complete_read(started, Operation::Get)?;
             return Ok(None);
         };
 
@@ -691,35 +749,84 @@ impl DbInner {
             .read_path
             .values
             .read_value(&encoded_pointer, key)
-            .map_err(|error| self.handle_read_failure(error, ReadFailureDomain::ValueLog))?;
-        self.complete_read(started)?;
+            .map_err(|error| {
+                self.handle_read_failure(error, ReadFailureDomain::ValueLog, Operation::Get)
+            })?;
+        self.complete_read(started, Operation::Get)?;
         Ok(Some(value))
     }
 
-    fn begin_read(&self) -> Result<ReadStateSnapshot> {
+    pub(crate) fn begin_read(&self, operation: Operation) -> Result<ReadStateSnapshot> {
         let state = self.read_path.runtime.state_snapshot();
         if state.instance_state == InstanceState::Poisoned {
-            return Err(poisoned_read_error());
+            return Err(poisoned_read_error(operation));
         }
         Ok(state)
     }
 
-    fn complete_read(&self, started: ReadStateSnapshot) -> Result<()> {
+    pub(crate) fn complete_read(
+        &self,
+        started: ReadStateSnapshot,
+        operation: Operation,
+    ) -> Result<()> {
         let current = self.read_path.runtime.state_snapshot();
         if current.instance_state == InstanceState::Poisoned
             && current.state_epoch != started.state_epoch
         {
-            return Err(poisoned_read_error());
+            return Err(poisoned_read_error(operation));
         }
         Ok(())
+    }
+
+    pub(crate) fn select_read_view(
+        self: &Arc<Self>,
+        options: &ReadOptions<'_>,
+        operation: Operation,
+        started: ReadStateSnapshot,
+    ) -> Result<Arc<dyn UserIndexSnapshot>> {
+        match options.snapshot {
+            Some(snapshot) if snapshot.belongs_to(self) => Ok(snapshot.view()),
+            Some(_) => Err(invalid_read_argument(operation, started.instance_state)),
+            None => Arc::clone(&self.read_path.index)
+                .snapshot_view()
+                .map_err(|error| {
+                    self.handle_read_failure(error, ReadFailureDomain::Index, operation)
+                }),
+        }
+    }
+
+    pub(crate) fn map_index_read_failure(
+        &self,
+        error: StorageError,
+        operation: Operation,
+    ) -> StorageError {
+        self.handle_read_failure(error, ReadFailureDomain::Index, operation)
+    }
+
+    pub(crate) fn materialize_index_entry(
+        &self,
+        started: ReadStateSnapshot,
+        operation: Operation,
+        entry: IndexEntry,
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        let value = self
+            .read_path
+            .values
+            .read_value(&entry.value, &entry.key)
+            .map_err(|error| {
+                self.handle_read_failure(error, ReadFailureDomain::ValueLog, operation)
+            })?;
+        self.complete_read(started, operation)?;
+        Ok((entry.key, value))
     }
 
     fn handle_read_failure(
         &self,
         mut error: StorageError,
         domain: ReadFailureDomain,
+        operation: Operation,
     ) -> StorageError {
-        error.operation = Operation::Get;
+        error.operation = operation;
         error.protocol_stage = ProtocolStage::Read;
         error.write_outcome = None;
 
@@ -814,11 +921,21 @@ fn read_retry_advice(
     }
 }
 
-fn poisoned_read_error() -> StorageError {
-    StorageError::read_error(
+fn poisoned_read_error(operation: Operation) -> StorageError {
+    StorageError::read_operation_error(
         StorageErrorKind::StoragePoisoned,
+        operation,
         InstanceState::Poisoned,
         RetryAdvice::ReopenAndVerify,
+    )
+}
+
+fn invalid_read_argument(operation: Operation, state: InstanceState) -> StorageError {
+    StorageError::read_operation_error(
+        StorageErrorKind::InvalidArgument,
+        operation,
+        state,
+        RetryAdvice::FixRequestAndRetrySameInstance,
     )
 }
 
@@ -841,11 +958,29 @@ impl Clone for Db {
 }
 
 #[cfg(not(test))]
-struct PublicOperationGuard {
+pub(crate) struct PublicOperationGuard {
     // Drop the lifecycle guard before releasing the Arc that keeps all storage
     // resources and the root lock alive for the operation.
     _operation: OperationGuard,
     _inner: Arc<DbInner>,
+}
+
+#[cfg(not(test))]
+impl DbInner {
+    pub(crate) fn begin_operation(
+        self: &Arc<Self>,
+        operation: Operation,
+    ) -> Result<PublicOperationGuard> {
+        let operation_guard = self
+            .live
+            .lifecycle
+            .acquire_operation()
+            .ok_or_else(|| lifecycle_admission_error(operation, self.instance_state()))?;
+        Ok(PublicOperationGuard {
+            _operation: operation_guard,
+            _inner: Arc::clone(self),
+        })
+    }
 }
 
 impl Db {
@@ -1038,18 +1173,42 @@ impl Db {
     pub fn snapshot(&self) -> Result<Snapshot> {
         #[cfg(not(test))]
         let _operation = self.begin_operation(Operation::Snapshot)?;
-        Err(self
-            .inner
-            .unsupported_error(Operation::Snapshot, ProtocolStage::Read))
+        let started = self.inner.begin_read(Operation::Snapshot)?;
+        let view =
+            self.inner
+                .select_read_view(&ReadOptions::default(), Operation::Snapshot, started)?;
+        self.inner.complete_read(started, Operation::Snapshot)?;
+        #[cfg(not(test))]
+        let snapshot = Snapshot::new(Arc::clone(&self.inner), view, self.lease.clone());
+        #[cfg(test)]
+        let snapshot = Snapshot::new_for_test(Arc::clone(&self.inner), view);
+        Ok(snapshot)
     }
 
     pub fn iter(&self, options: &ReadOptions<'_>) -> Result<DbIterator> {
         #[cfg(not(test))]
         let _operation = self.begin_operation(Operation::Iterator)?;
-        let _ = options;
-        Err(self
+        let started = self.inner.begin_read(Operation::Iterator)?;
+        let view = self
             .inner
-            .unsupported_error(Operation::Iterator, ProtocolStage::Read))
+            .select_read_view(options, Operation::Iterator, started)?;
+        let iterator = view.iter_user().map_err(|error| {
+            self.inner
+                .map_index_read_failure(error, Operation::Iterator)
+        })?;
+        self.inner.complete_read(started, Operation::Iterator)?;
+        #[cfg(not(test))]
+        let iterator = DbIterator::new(
+            Arc::clone(&self.inner),
+            view,
+            iterator,
+            Operation::Iterator,
+            self.lease.clone(),
+        );
+        #[cfg(test)]
+        let iterator =
+            DbIterator::new_for_test(Arc::clone(&self.inner), view, iterator, Operation::Iterator);
+        Ok(iterator)
     }
 
     pub fn range(
@@ -1060,10 +1219,69 @@ impl Db {
     ) -> Result<RangeCursor> {
         #[cfg(not(test))]
         let _operation = self.begin_operation(Operation::Range)?;
-        let _ = (options, range, limit);
-        Err(self
+        let started = self.inner.begin_read(Operation::Range)?;
+        validate_range_bound(range.start, started.instance_state)?;
+        validate_range_bound(range.end, started.instance_state)?;
+        if let Some(snapshot) = options.snapshot
+            && !snapshot.belongs_to(&self.inner)
+        {
+            return Err(invalid_read_argument(
+                Operation::Range,
+                started.instance_state,
+            ));
+        }
+
+        let is_empty = limit == 0
+            || matches!((range.start, range.end), (None, Some(end)) if end.is_empty())
+            || matches!((range.start, range.end), (Some(start), Some(end)) if start >= end);
+        if is_empty {
+            self.inner.complete_read(started, Operation::Range)?;
+            #[cfg(not(test))]
+            let inner = DbIterator::empty(
+                Arc::clone(&self.inner),
+                Operation::Range,
+                self.lease.clone(),
+            );
+            #[cfg(test)]
+            let inner = DbIterator::empty_for_test(Arc::clone(&self.inner), Operation::Range);
+            #[cfg(not(test))]
+            let cursor = RangeCursor::new(inner, None, 0);
+            #[cfg(test)]
+            let cursor = RangeCursor::new_for_test(inner, None, 0);
+            return Ok(cursor);
+        }
+
+        let end = range
+            .end
+            .map(|bound| clone_range_bound(bound, started.instance_state))
+            .transpose()?;
+        let view = self
             .inner
-            .unsupported_error(Operation::Range, ProtocolStage::Read))
+            .select_read_view(options, Operation::Range, started)?;
+        let iterator = view
+            .iter_user()
+            .map_err(|error| self.inner.map_index_read_failure(error, Operation::Range))?;
+        self.inner.complete_read(started, Operation::Range)?;
+        #[cfg(not(test))]
+        let mut inner = DbIterator::new(
+            Arc::clone(&self.inner),
+            Arc::clone(&view),
+            iterator,
+            Operation::Range,
+            self.lease.clone(),
+        );
+        #[cfg(test)]
+        let mut inner =
+            DbIterator::new_for_test(Arc::clone(&self.inner), view, iterator, Operation::Range);
+        match range.start {
+            Some(start) => inner.seek_before(start, end.as_deref()),
+            None => inner.seek_to_first_before(end.as_deref()),
+        }
+        #[cfg(not(test))]
+        let cursor = RangeCursor::new(inner, end, limit);
+        #[cfg(test)]
+        let cursor = RangeCursor::new_for_test(inner, end, limit);
+        Ok(cursor)
     }
 
     pub fn stats(&self) -> DbStats {
@@ -1081,16 +1299,7 @@ impl Db {
 
     #[cfg(not(test))]
     fn begin_operation(&self, operation: Operation) -> Result<PublicOperationGuard> {
-        let operation_guard = self
-            .inner
-            .live
-            .lifecycle
-            .acquire_operation()
-            .ok_or_else(|| lifecycle_admission_error(operation, self.inner.instance_state()))?;
-        Ok(PublicOperationGuard {
-            _operation: operation_guard,
-            _inner: Arc::clone(&self.inner),
-        })
+        self.inner.begin_operation(operation)
     }
 }
 
@@ -1157,6 +1366,27 @@ fn copy_options(options: &Options) -> Options {
         compression: options.compression,
         vlog_read_handle_cache_capacity: options.vlog_read_handle_cache_capacity,
     }
+}
+
+fn validate_range_bound(bound: Option<&[u8]>, state: InstanceState) -> Result<()> {
+    if bound.is_some_and(|bound| !bound.is_empty() && bound.len() > MAX_KEY_VALUE_SIZE) {
+        return Err(invalid_read_argument(Operation::Range, state));
+    }
+    Ok(())
+}
+
+fn clone_range_bound(bound: &[u8], state: InstanceState) -> Result<Vec<u8>> {
+    let mut owned = Vec::new();
+    owned.try_reserve_exact(bound.len()).map_err(|_| {
+        StorageError::read_operation_error(
+            StorageErrorKind::ResourceExhausted,
+            Operation::Range,
+            state,
+            RetryAdvice::RetrySameInstance,
+        )
+    })?;
+    owned.extend_from_slice(bound);
+    Ok(owned)
 }
 
 #[cfg(not(test))]

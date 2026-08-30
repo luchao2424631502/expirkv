@@ -13,10 +13,12 @@ pub(crate) use error::{
     WriteOutcome,
 };
 
-pub struct Snapshot;
-pub struct DbIterator;
-pub struct RangeCursor;
-pub struct KeyRange<'a>(std::marker::PhantomData<&'a ()>);
+#[path = "../src/snapshot.rs"]
+mod snapshot;
+pub(crate) use snapshot::Snapshot;
+#[path = "../src/cursor.rs"]
+mod cursor;
+pub(crate) use cursor::{DbIterator, KeyRange, RangeCursor};
 
 #[path = "../src/stats.rs"]
 mod stats;
@@ -48,7 +50,10 @@ use commit::{
     CommitCoordinator, DurableFrontier, DurableVLogEnd, TxUuidSource, preflight_delete,
     preflight_put,
 };
-use db::{Db, ReadRuntime, ReadStateSnapshot, UserIndexReader, ValueReader};
+use db::{
+    Db, ReadRuntime, ReadStateSnapshot, UserIndexIterator, UserIndexReader, UserIndexSnapshot,
+    ValueReader,
+};
 use index::{
     FjallBackend, FjallIndexOptions, IndexBackend, IndexCommitMode, IndexCompression,
     initialization_batch,
@@ -335,6 +340,19 @@ struct CountingIndex {
     response: Mutex<IndexResponse>,
 }
 
+struct EmptySnapshot;
+
+impl UserIndexSnapshot for EmptySnapshot {
+    fn get_user_pointer(&self, _key: &[u8]) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    fn iter_user(&self) -> Result<UserIndexIterator> {
+        let iterator: UserIndexIterator = Box::new(std::iter::empty());
+        Ok(iterator)
+    }
+}
+
 enum IndexResponse {
     Missing,
     Pointer(Vec<u8>),
@@ -358,6 +376,11 @@ impl UserIndexReader for CountingIndex {
             IndexResponse::Pointer(pointer) => Ok(Some(pointer.clone())),
             IndexResponse::Error(kind) => Err(deliberately_mismapped_index_error(*kind)),
         }
+    }
+
+    fn snapshot_view(self: Arc<Self>) -> Result<Arc<dyn UserIndexSnapshot>> {
+        let _ = self;
+        Ok(Arc::new(EmptySnapshot))
     }
 }
 
@@ -415,8 +438,9 @@ fn invalid_key_and_snapshot_are_rejected_before_index_access() {
         StorageErrorKind::InvalidArgument
     );
 
-    let snapshot = Snapshot;
-    let unsupported = db
+    let (foreign, _, _, _) = fake_db(IndexResponse::Missing, b"");
+    let snapshot = foreign.snapshot().unwrap();
+    let invalid_snapshot = db
         .get(
             &ReadOptions {
                 snapshot: Some(&snapshot),
@@ -424,10 +448,13 @@ fn invalid_key_and_snapshot_are_rejected_before_index_access() {
             b"key",
         )
         .unwrap_err();
-    assert_eq!(unsupported.kind, StorageErrorKind::Unsupported);
-    assert_eq!(unsupported.operation, Operation::Get);
-    assert_eq!(unsupported.protocol_stage, ProtocolStage::Read);
-    assert_eq!(unsupported.instance_state, Some(InstanceState::Healthy));
+    assert_eq!(invalid_snapshot.kind, StorageErrorKind::InvalidArgument);
+    assert_eq!(invalid_snapshot.operation, Operation::Get);
+    assert_eq!(invalid_snapshot.protocol_stage, ProtocolStage::Read);
+    assert_eq!(
+        invalid_snapshot.instance_state,
+        Some(InstanceState::Healthy)
+    );
     assert_eq!(index.calls.load(Ordering::SeqCst), 0);
     assert_eq!(values.calls.load(Ordering::SeqCst), 0);
 }

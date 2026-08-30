@@ -186,29 +186,41 @@ fn empty_batches_and_sync_barrier_update_real_stats() -> TestResult {
 }
 
 #[test]
-fn delayed_capabilities_are_structured_unsupported() -> TestResult {
+fn stage15_read_views_are_available_while_destroy_remains_unsupported() -> TestResult {
     let folder = TempDir::new()?;
     let root = folder.path().join("db");
     let db = Db::open(&create_options(), &root)?;
+    db.put(&WriteOptions::default(), b"key", b"snapshot-value")?;
 
-    let snapshot = expect_error(db.snapshot());
-    assert_eq!(snapshot.kind, StorageErrorKind::Unsupported);
-    assert_eq!(snapshot.operation, Operation::Snapshot);
+    let snapshot = db.snapshot()?;
+    db.put(&WriteOptions::default(), b"key", b"current-value")?;
+    let read_options = ReadOptions {
+        snapshot: Some(&snapshot),
+    };
+    assert_eq!(
+        db.get(&read_options, b"key")?,
+        Some(b"snapshot-value".to_vec())
+    );
 
-    let iterator = expect_error(db.iter(&ReadOptions::default()));
-    assert_eq!(iterator.kind, StorageErrorKind::Unsupported);
-    assert_eq!(iterator.operation, Operation::Iterator);
+    let mut iterator = db.iter(&read_options)?;
+    assert!(!iterator.valid());
+    assert!(iterator.status().is_ok());
+    iterator.seek_to_first();
+    assert_eq!(iterator.key(), Some(b"key".as_slice()));
+    assert_eq!(iterator.value(), Some(b"snapshot-value".as_slice()));
 
-    let range = expect_error(db.range(
-        &ReadOptions::default(),
+    let range = db.range(
+        &read_options,
         KeyRange {
             start: Some(b"a"),
             end: Some(b"z"),
         },
         10,
-    ));
-    assert_eq!(range.kind, StorageErrorKind::Unsupported);
-    assert_eq!(range.operation, Operation::Range);
+    )?;
+    assert!(range.valid());
+    assert_eq!(range.key(), Some(b"key".as_slice()));
+    assert_eq!(range.value(), Some(b"snapshot-value".as_slice()));
+    assert!(range.status().is_ok());
 
     let destroy = Db::destroy(Path::new(&root), &Options::default()).unwrap_err();
     assert_eq!(destroy.kind, StorageErrorKind::Unsupported);

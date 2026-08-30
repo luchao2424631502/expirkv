@@ -196,25 +196,23 @@ impl StorageError {
         )
     }
 
-    pub(crate) fn invalid_iterator_target(instance_state: InstanceState) -> Self {
-        Self::new(
-            StorageErrorKind::InvalidArgument,
-            Operation::Iterator,
-            ProtocolStage::Read,
-            None,
-            Some(instance_state),
-            RetryAdvice::FixRequestAndRetrySameInstance,
-        )
-    }
-
     pub(crate) fn read_error(
         kind: StorageErrorKind,
         instance_state: InstanceState,
         retry_advice: RetryAdvice,
     ) -> Self {
+        Self::read_operation_error(kind, Operation::Get, instance_state, retry_advice)
+    }
+
+    pub(crate) fn read_operation_error(
+        kind: StorageErrorKind,
+        operation: Operation,
+        instance_state: InstanceState,
+        retry_advice: RetryAdvice,
+    ) -> Self {
         Self::new(
             kind,
-            Operation::Get,
+            operation,
             ProtocolStage::Read,
             None,
             Some(instance_state),
