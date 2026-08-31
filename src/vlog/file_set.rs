@@ -171,6 +171,18 @@ impl VLogDirectory {
         self.open_at(&name, OPEN_READ_ONLY | OPEN_CLOEXEC | OPEN_NOFOLLOW, 0)
     }
 
+    pub(crate) fn remove_file_for_destroy(&self, file_id: u32) -> io::Result<()> {
+        let name = vlog_file_name_c(file_id)?;
+        // SAFETY: `self.handle` owns a live directory descriptor, `name` is a
+        // validated single component, and unlinkat never follows the target.
+        let result = unsafe { unlinkat(self.handle.as_raw_fd(), name.as_ptr(), 0) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
     pub(super) fn open_writable(
         &self,
         _capability: &WriterFileCapability,

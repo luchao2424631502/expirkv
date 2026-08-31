@@ -703,4 +703,5 @@ fn late_bound_backend_error(operation: Operation, protocol_stage: ProtocolStage)
 // Included source modules expose only the helpers each test crate uses.
 pub(crate) use fjall::{
     TestCommitFailure, TestCompression, TestFjallError, TestUserKeyspaceConfiguration,
+    shadow_remove_retry_probe_for_test,
 };

@@ -1,12 +1,10 @@
-use std::error::Error;
-use std::path::Path;
-
 use rustkv::{
     Compression, CursorState, Db, DbIterator, DbStats, DestroyFailureContext, DestroyStage,
     InstanceState, KeyRange, LatchedErrorSummary, ManagedObject, Operation, Options, ProtocolStage,
     RangeCursor, ReadOptions, Result, RetryAdvice, Snapshot, StorageError, StorageErrorKind,
     VLogPosition, WriteBatch, WriteOptions, WriteOutcome,
 };
+use std::error::Error;
 use tempfile::TempDir;
 
 fn assert_clone_send_sync<T: Clone + Send + Sync>() {}
@@ -246,7 +244,7 @@ fn errors_do_not_copy_user_bytes_into_public_text_or_source() {
 }
 
 #[test]
-fn open_reports_missing_and_delayed_destroy_remains_unsupported() {
+fn missing_open_fails_and_missing_destroy_is_idempotent_success() {
     let options = Options::default();
     let folder = TempDir::new().unwrap();
     let missing_path = folder.path().join("missing-db");
@@ -259,14 +257,8 @@ fn open_reports_missing_and_delayed_destroy_remains_unsupported() {
     assert_eq!(open_error.write_outcome, None);
     assert_eq!(open_error.instance_state, None);
 
-    let destroy_error = match Db::destroy(Path::new(&missing_path), &options) {
-        Ok(()) => panic!("stage 1 must not report a fake destroy success"),
-        Err(error) => error,
-    };
-    assert_eq!(destroy_error.kind, StorageErrorKind::Unsupported);
-    assert_eq!(destroy_error.operation, Operation::Destroy);
-    assert_eq!(destroy_error.write_outcome, None);
-    assert!(destroy_error.destroy_failure.is_none());
+    Db::destroy(&missing_path, &options).expect("destroy of a missing path is idempotent");
+    assert!(!missing_path.exists());
 }
 
 #[allow(dead_code)]

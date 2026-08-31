@@ -25,7 +25,8 @@ use std::time::{Duration, Instant};
 use rustkv::{Db, Options, ReadOptions, WriteBatch, WriteOptions};
 use tempfile::TempDir;
 
-type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+pub(crate) type TestResult<T = ()> =
+    std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 type Oracle = BTreeMap<Vec<u8>, ExpectedValue>;
 
 #[derive(Debug)]
@@ -52,6 +53,7 @@ const CRASH_VALUE_LEN: usize = 59_000;
 const FILLER_KEYS_PER_BATCH: usize = 64;
 const CRASH_COMPLETE_KEYS: usize = 32;
 const CRASH_CANDIDATE_KEYS: usize = 512;
+pub(crate) const STAGE16_CLEANUP_BACKLOG_TRANSACTIONS: usize = 100_000;
 const ORACLE_MAGIC: &[u8; 8] = b"RKVORCL2";
 const ORACLE_RAW: u8 = 0;
 const ORACLE_GENERATED: u8 = 1;
@@ -243,6 +245,14 @@ fn record_rollover_semantics(db: &Db, oracle: &mut Oracle, new_file_id: u32) -> 
 }
 
 fn fill_through_ten_gib(db: &Db, oracle: &mut Oracle) -> TestResult {
+    fill_through_ten_gib_with_hook(db, oracle, |_, _| Ok(()))
+}
+
+fn fill_through_ten_gib_with_hook(
+    db: &Db,
+    oracle: &mut Oracle,
+    mut after_batch: impl FnMut(&Db, u64) -> TestResult,
+) -> TestResult {
     let mut round = 0_u64;
     let mut file_count = db.stats().vlog_file_count;
     let mut rollovers = Vec::new();
@@ -289,6 +299,7 @@ fn fill_through_ten_gib(db: &Db, oracle: &mut Oracle) -> TestResult {
                 stats.vlog_file_count
             );
         }
+        after_batch(db, round)?;
     }
 
     assert!(rollovers.contains(&(0, 1)), "file 0 never rolled to file 1");
@@ -306,6 +317,74 @@ fn fill_through_ten_gib(db: &Db, oracle: &mut Oracle) -> TestResult {
             .is_some_and(|file_id| file_id >= 2)
     );
     Ok(())
+}
+
+/// Builds the production-geometry fixture used by the explicit stage-16
+/// lifecycle test. Periodic real durability barriers make Descriptor cleanup
+/// overlap later foreground commits. The final buffered tail must remain above
+/// the captured durable frontier.
+#[allow(dead_code)] // Reused when this test is included by lifecycle_multivlog_10g.
+pub(crate) fn build_stage16_cleanup_fixture(root: &Path) -> TestResult<(Db, u64, u64)> {
+    let db = Db::open(&create_options(), root)?;
+    let mut oracle = Oracle::new();
+    exercise_initial_crud(&db, &mut oracle)?;
+    fill_through_ten_gib_with_hook(&db, &mut oracle, |db, round| {
+        if round.is_multiple_of(128) {
+            db.write(&WriteOptions { sync: true }, &WriteBatch::new())?;
+        }
+        Ok(())
+    })?;
+    assert_ten_gib_vlog_layout(root, &db)?;
+
+    db.write(&WriteOptions { sync: true }, &WriteBatch::new())?;
+    let durable_seq = db.stats().durable_seq;
+    let tail_key = key_32("stage16-buffered-tail");
+    db.put(&WriteOptions::default(), &tail_key, b"must-keep-descriptor")?;
+    let stats = db.stats();
+    assert_eq!(stats.durable_seq, durable_seq);
+    assert_eq!(stats.head_seq, durable_seq + 1);
+    Ok((db, durable_seq, stats.head_seq))
+}
+
+/// Appends many one-Mutation buffered Descriptors. Once one empty durability
+/// barrier covers this range, cleanup needs two independent Buffer commits per
+/// transaction (Mutation first, Meta second), creating an observable backlog
+/// for the stage-16 Drop/join test without adding another large payload.
+#[allow(dead_code)] // Reused when this test is included by lifecycle_multivlog_10g.
+pub(crate) fn append_stage16_cleanup_backlog(db: &Db) -> TestResult<(u64, u64)> {
+    let first_seq = db
+        .stats()
+        .head_seq
+        .checked_add(1)
+        .ok_or("cleanup backlog sequence overflow")?;
+    for _ in 0..STAGE16_CLEANUP_BACKLOG_TRANSACTIONS {
+        db.delete(
+            &WriteOptions::default(),
+            b"stage16-cleanup-backlog-missing-key",
+        )?;
+    }
+    let last_seq = db.stats().head_seq;
+    assert_eq!(
+        last_seq - first_seq + 1,
+        u64::try_from(STAGE16_CLEANUP_BACKLOG_TRANSACTIONS)?
+    );
+    Ok((first_seq, last_seq))
+}
+
+#[allow(dead_code)] // Reused when this test is included by lifecycle_multivlog_10g.
+pub(crate) fn stage16_started_write_batch() -> TestResult<WriteBatch> {
+    let mut batch = WriteBatch::new();
+    // Keep the physical append observably in flight long enough for the parent
+    // process to stop this child after the VLog has grown but before write()
+    // returns. The stopped-child test rejects the run if that boundary was
+    // missed, so this size cannot silently turn into a false positive.
+    for slot in 0..(CRASH_CANDIDATE_KEYS * 4) {
+        batch.put(
+            key_32(format!("stage16-started-{slot:04}")),
+            generated_value(CRASH_CANDIDATE_TAG - 1, slot, CRASH_VALUE_LEN),
+        )?;
+    }
+    Ok(batch)
 }
 
 fn write_oracle(path: &Path, oracle: &Oracle) -> io::Result<()> {
@@ -484,12 +563,27 @@ fn assert_ten_gib_vlog_layout(root: &Path, db: &Db) -> TestResult {
 fn spawn_child(mode: &str, root: &Path) -> io::Result<std::process::Child> {
     Command::new(env::current_exe()?)
         .arg("--exact")
-        .arg("process_child")
+        .arg(process_child_test_name())
         .arg("--nocapture")
         .env(CHILD_MODE, mode)
         .env(CHILD_PATH, root)
         .stdout(Stdio::piped())
         .spawn()
+}
+
+fn process_child_test_name() -> String {
+    let module = module_path!();
+    let crate_name = env!("CARGO_CRATE_NAME");
+    if module == crate_name {
+        return "process_child".to_owned();
+    }
+    module
+        .strip_prefix(crate_name)
+        .and_then(|suffix| suffix.strip_prefix("::"))
+        .map_or_else(
+            || "process_child".to_owned(),
+            |suffix| format!("{suffix}::process_child"),
+        )
 }
 
 fn start_line_reader(child: &mut Child) -> io::Result<mpsc::Receiver<String>> {

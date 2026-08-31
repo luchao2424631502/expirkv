@@ -186,7 +186,7 @@ fn empty_batches_and_sync_barrier_update_real_stats() -> TestResult {
 }
 
 #[test]
-fn stage15_read_views_are_available_while_destroy_remains_unsupported() -> TestResult {
+fn stage16_read_views_remain_available_and_open_database_destroy_is_busy() -> TestResult {
     let folder = TempDir::new()?;
     let root = folder.path().join("db");
     let db = Db::open(&create_options(), &root)?;
@@ -223,7 +223,7 @@ fn stage15_read_views_are_available_while_destroy_remains_unsupported() -> TestR
     assert!(range.status().is_ok());
 
     let destroy = Db::destroy(Path::new(&root), &Options::default()).unwrap_err();
-    assert_eq!(destroy.kind, StorageErrorKind::Unsupported);
+    assert_eq!(destroy.kind, StorageErrorKind::Busy);
     assert_eq!(destroy.operation, Operation::Destroy);
     Ok(())
 }

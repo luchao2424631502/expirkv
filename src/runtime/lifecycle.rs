@@ -3,6 +3,8 @@
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use super::RuntimeControl;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct LifecycleSnapshot {
     pub(crate) accepting_operations: bool,
@@ -19,6 +21,7 @@ struct LifecycleInner {
 pub(crate) struct LifecycleController {
     inner: Mutex<LifecycleInner>,
     quiesced: Condvar,
+    runtime: std::sync::OnceLock<Arc<RuntimeControl>>,
 }
 
 impl LifecycleController {
@@ -30,11 +33,16 @@ impl LifecycleController {
                 operation_guards: 0,
             }),
             quiesced: Condvar::new(),
+            runtime: std::sync::OnceLock::new(),
         });
         let lease = ExternalLease {
             controller: Arc::clone(&controller),
         };
         (controller, lease)
+    }
+
+    pub(crate) fn bind_runtime(&self, runtime: Arc<RuntimeControl>) -> bool {
+        self.runtime.set(runtime).is_ok()
     }
 
     // 写闸门
@@ -92,15 +100,19 @@ impl LifecycleController {
     }
 
     fn release_external_lease(&self) {
-        let notify = {
+        let (closed, notify) = {
             let mut inner = lock_inner(&self.inner);
             debug_assert!(inner.external_leases > 0);
             inner.external_leases -= 1;
-            if inner.external_leases == 0 {
+            let closed = inner.external_leases == 0;
+            if closed {
                 inner.accepting_operations = false;
             }
-            is_quiescent(&inner)
+            (closed, is_quiescent(&inner))
         };
+        if closed && let Some(runtime) = self.runtime.get() {
+            runtime.close_write_admission();
+        }
         if notify {
             self.quiesced.notify_all();
         }

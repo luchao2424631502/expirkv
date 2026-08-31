@@ -5,6 +5,11 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(not(test))]
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
+#[cfg(not(test))]
+use std::thread::{self, JoinHandle};
 
 #[cfg(not(test))]
 use crate::WriteOutcome;
@@ -13,6 +18,11 @@ use crate::commit::{
     CommitCoordinator, DurableVLogEnd, OsTxUuidSource, preflight_batch, preflight_delete,
     preflight_put,
 };
+use crate::commit::{
+    DurableFrontier, RECOVERY_STATE_KEY, decode_tx_meta_key, decode_tx_mutation_key,
+    encode_tx_meta_key,
+};
+use crate::error::{DestroyFailureContext, DestroyStage, ManagedObject};
 use crate::format::{
     FORMAT_ENCODED_LEN, FORMAT_FILE_NAME, FORMAT_TEMP_FILE_NAME, FormatMetadataV0,
 };
@@ -22,13 +32,13 @@ use crate::index::LateBoundFjallBackend;
 use crate::index::TestCommitFailure;
 use crate::index::{
     DATABASE_IDENTITY_KEY, DURABLE_FRONTIER_KEY, DatabaseIdentityV0, FjallBackend, HEAD_SEQ_KEY,
-    IndexApplyState, IndexBackend, IndexCommitError, IndexCommitMode, IndexEntry,
-    InternalIndexError, InternalIndexSpace, InternalKeyRange, initialization_batch,
+    IndexApplyState, IndexAtomicBatch, IndexBackend, IndexCommitError, IndexCommitMode, IndexEntry,
+    IndexMutation, InternalIndexError, InternalIndexSpace, InternalKeyRange, initialization_batch,
     is_encoded_empty_durable_frontier, is_encoded_head_seq_zero,
 };
 use crate::lock::{
     ManagedEntryKind, RootLock, invalid_argument_error, layout_error, not_found_error,
-    open_io_error, sync_directory_tree_nofollow, sync_file_data,
+    open_io_error, sync_directory_tree_nofollow, sync_file_data, validate_directory_tree_nofollow,
 };
 #[cfg(not(test))]
 use crate::recovery::{analyze_recovery, execute_recovery};
@@ -37,7 +47,12 @@ use crate::runtime::{ExternalLease, LifecycleController, OperationGuard, Runtime
 #[cfg(not(test))]
 use crate::stats::StatsState;
 #[cfg(not(test))]
-use crate::vlog::file_set::{FileCatalog, FileSet, VLogDirectory};
+use crate::vlog::file_set::{FileCatalog, FileSet};
+use crate::vlog::file_set::{VLogDirectory, read_exact_at};
+use crate::vlog::format::{
+    FILE_HEADER_ENCODED_LEN, MAX_VLOG_FILE_SIZE, PAGE_HEADER_ENCODED_LEN, PageHeader,
+    VLogFileHeader,
+};
 #[cfg(not(test))]
 use crate::vlog::format::{VLogGeometry, VLogPosition};
 #[cfg(not(test))]
@@ -668,6 +683,429 @@ struct ReadPath {
     values: Arc<dyn ValueReader>,
 }
 
+const CLEANUP_MAX_KEYS_PER_BATCH: usize = 1_024;
+const CLEANUP_MAX_ENCODED_KEY_BYTES: usize = 1_048_576;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DescriptorCleanupProgress {
+    pub(crate) captured_durable_seq: u64,
+    pub(crate) deleted_mutations: usize,
+    pub(crate) deleted_meta: usize,
+    pub(crate) committed_batches: usize,
+    pub(crate) blocked_by_recovery: bool,
+}
+
+pub(crate) fn cleanup_descriptors_once<B: IndexBackend>(
+    backend: &B,
+    stop: &AtomicBool,
+) -> Result<DescriptorCleanupProgress> {
+    let recovery_state = backend
+        .get_internal(InternalIndexSpace::System, RECOVERY_STATE_KEY)
+        .map_err(background_index_error)?;
+    if recovery_state.is_some() {
+        return Ok(DescriptorCleanupProgress {
+            blocked_by_recovery: true,
+            ..DescriptorCleanupProgress::default()
+        });
+    }
+
+    let encoded_frontier = backend
+        .get_internal(InternalIndexSpace::System, DURABLE_FRONTIER_KEY)
+        .map_err(background_index_error)?
+        .ok_or_else(background_corruption)?;
+    let captured_durable_seq = DurableFrontier::decode(&encoded_frontier)
+        .map_err(background_index_error)?
+        .durable_seq;
+    let mut progress = DescriptorCleanupProgress {
+        captured_durable_seq,
+        ..DescriptorCleanupProgress::default()
+    };
+    if stop.load(Ordering::Acquire) {
+        return Ok(progress);
+    }
+
+    let range = stable_descriptor_range(captured_durable_seq)?;
+    let entries = backend
+        .scan_internal(InternalIndexSpace::Transaction, range)
+        .map_err(background_index_error)?;
+    let mut current_seq = None;
+    let mut meta_key = None;
+    let mut saw_mutation = false;
+    let mut last_ordinal = None;
+    let mut pending_mutations = Vec::new();
+    let mut pending_key_bytes = 0_usize;
+
+    for entry in entries {
+        if stop.load(Ordering::Acquire) {
+            return Ok(progress);
+        }
+        let entry = entry.map_err(background_index_error)?;
+        let (commit_seq, kind) = decode_cleanup_key(&entry.key)?;
+        if commit_seq > captured_durable_seq {
+            return Err(background_corruption());
+        }
+        if current_seq.is_some_and(|current| current != commit_seq) {
+            flush_cleanup_transaction(
+                backend,
+                stop,
+                &mut pending_mutations,
+                &mut pending_key_bytes,
+                &mut meta_key,
+                &mut progress,
+            )?;
+            if stop.load(Ordering::Acquire) {
+                return Ok(progress);
+            }
+            saw_mutation = false;
+            last_ordinal = None;
+        }
+        current_seq = Some(commit_seq);
+
+        match kind {
+            CleanupKeyKind::Meta => {
+                if saw_mutation || meta_key.replace(entry.key).is_some() {
+                    return Err(background_corruption());
+                }
+            }
+            CleanupKeyKind::Mutation(ordinal) => {
+                if last_ordinal.is_some_and(|previous| previous >= ordinal) {
+                    return Err(background_corruption());
+                }
+                last_ordinal = Some(ordinal);
+                saw_mutation = true;
+                pending_key_bytes = pending_key_bytes
+                    .checked_add(entry.key.len())
+                    .ok_or_else(background_resource_exhausted)?;
+                pending_mutations
+                    .try_reserve(1)
+                    .map_err(|_| background_resource_exhausted())?;
+                pending_mutations.push(entry.key);
+                if pending_mutations.len() >= CLEANUP_MAX_KEYS_PER_BATCH
+                    || pending_key_bytes >= CLEANUP_MAX_ENCODED_KEY_BYTES
+                {
+                    commit_cleanup_keys(
+                        backend,
+                        stop,
+                        &mut pending_mutations,
+                        &mut pending_key_bytes,
+                        false,
+                        &mut progress,
+                    )?;
+                }
+            }
+        }
+    }
+
+    flush_cleanup_transaction(
+        backend,
+        stop,
+        &mut pending_mutations,
+        &mut pending_key_bytes,
+        &mut meta_key,
+        &mut progress,
+    )?;
+    Ok(progress)
+}
+
+#[derive(Clone, Copy)]
+enum CleanupKeyKind {
+    Meta,
+    Mutation(u64),
+}
+
+fn decode_cleanup_key(key: &[u8]) -> Result<(u64, CleanupKeyKind)> {
+    match key.len() {
+        11 => decode_tx_meta_key(key)
+            .map(|seq| (seq, CleanupKeyKind::Meta))
+            .map_err(background_index_error),
+        19 => decode_tx_mutation_key(key)
+            .map(|(seq, ordinal)| (seq, CleanupKeyKind::Mutation(ordinal)))
+            .map_err(background_index_error),
+        _ => Err(background_corruption()),
+    }
+}
+
+fn stable_descriptor_range(captured_durable_seq: u64) -> Result<InternalKeyRange> {
+    let end_exclusive = captured_durable_seq
+        .checked_add(1)
+        .map(|next_seq| {
+            encode_tx_meta_key(next_seq)
+                .map_err(background_index_error)
+                .and_then(|key| try_copy_background_bytes(&key[..10]))
+        })
+        .transpose()?;
+    InternalKeyRange::new(None, end_exclusive).map_err(background_internal_index_error)
+}
+
+fn flush_cleanup_transaction<B: IndexBackend>(
+    backend: &B,
+    stop: &AtomicBool,
+    pending_mutations: &mut Vec<Vec<u8>>,
+    pending_key_bytes: &mut usize,
+    meta_key: &mut Option<Vec<u8>>,
+    progress: &mut DescriptorCleanupProgress,
+) -> Result<()> {
+    commit_cleanup_keys(
+        backend,
+        stop,
+        pending_mutations,
+        pending_key_bytes,
+        false,
+        progress,
+    )?;
+    if stop.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    if let Some(key) = meta_key.take() {
+        let mut keys = Vec::new();
+        keys.try_reserve_exact(1)
+            .map_err(|_| background_resource_exhausted())?;
+        keys.push(key);
+        let mut encoded_key_bytes = keys[0].len();
+        commit_cleanup_keys(
+            backend,
+            stop,
+            &mut keys,
+            &mut encoded_key_bytes,
+            true,
+            progress,
+        )?;
+    }
+    Ok(())
+}
+
+fn commit_cleanup_keys<B: IndexBackend>(
+    backend: &B,
+    stop: &AtomicBool,
+    keys: &mut Vec<Vec<u8>>,
+    encoded_key_bytes: &mut usize,
+    deleting_meta: bool,
+    progress: &mut DescriptorCleanupProgress,
+) -> Result<()> {
+    if keys.is_empty() || stop.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let key_count = keys.len();
+    let mut batch =
+        IndexAtomicBatch::try_with_capacity(key_count).map_err(background_internal_index_error)?;
+    for key in keys.drain(..) {
+        batch
+            .try_push(IndexMutation::DeleteInternal {
+                space: InternalIndexSpace::Transaction,
+                key,
+            })
+            .map_err(background_internal_index_error)?;
+    }
+    *encoded_key_bytes = 0;
+    backend
+        .commit_atomic(batch, IndexCommitMode::Buffer)
+        .map_err(background_cleanup_commit_error)?;
+    if deleting_meta {
+        progress.deleted_meta = progress
+            .deleted_meta
+            .checked_add(key_count)
+            .ok_or_else(background_resource_exhausted)?;
+    } else {
+        progress.deleted_mutations = progress
+            .deleted_mutations
+            .checked_add(key_count)
+            .ok_or_else(background_resource_exhausted)?;
+    }
+    progress.committed_batches = progress
+        .committed_batches
+        .checked_add(1)
+        .ok_or_else(background_resource_exhausted)?;
+    Ok(())
+}
+
+fn try_copy_background_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
+    let mut owned = Vec::new();
+    owned
+        .try_reserve_exact(bytes.len())
+        .map_err(|_| background_resource_exhausted())?;
+    owned.extend_from_slice(bytes);
+    Ok(owned)
+}
+
+fn background_index_error(mut error: StorageError) -> StorageError {
+    error.operation = Operation::Background;
+    error.protocol_stage = ProtocolStage::Maintenance;
+    error.write_outcome = None;
+    error.instance_state = None;
+    if matches!(
+        error.kind,
+        StorageErrorKind::Busy | StorageErrorKind::ResourceExhausted
+    ) {
+        error.retry_advice = RetryAdvice::RetrySameInstance;
+    }
+    error
+}
+
+fn background_internal_index_error(error: InternalIndexError) -> StorageError {
+    let mut mapped = StorageError::codec_error(
+        error.kind,
+        Operation::Background,
+        ProtocolStage::Maintenance,
+        None,
+        retry_advice_for(error.kind),
+    );
+    mapped.os_code = error.os_code;
+    mapped
+}
+
+pub(crate) fn background_cleanup_commit_error(error: IndexCommitError) -> StorageError {
+    let mut mapped = background_internal_index_error(error.source);
+    match error.apply_state {
+        IndexApplyState::Unknown => mapped.retry_advice = RetryAdvice::ReopenAndVerify,
+        IndexApplyState::NotApplied
+            if matches!(
+                mapped.kind,
+                StorageErrorKind::Busy | StorageErrorKind::ResourceExhausted
+            ) =>
+        {
+            mapped.retry_advice = RetryAdvice::RetrySameInstance;
+        }
+        // Even before Fjall commit is entered, an I/O failure may originate
+        // from reading DatabaseIdentity. The batch is known not to have been
+        // applied, but the live index can no longer be treated as trustworthy.
+        IndexApplyState::NotApplied if mapped.kind == StorageErrorKind::Io => {
+            mapped.retry_advice = RetryAdvice::ReopenAndVerify;
+        }
+        IndexApplyState::NotApplied => {}
+    }
+    mapped
+}
+
+fn background_corruption() -> StorageError {
+    StorageError::codec_error(
+        StorageErrorKind::Corruption,
+        Operation::Background,
+        ProtocolStage::Maintenance,
+        None,
+        RetryAdvice::RestoreOrRepair,
+    )
+}
+
+fn background_resource_exhausted() -> StorageError {
+    StorageError::codec_error(
+        StorageErrorKind::ResourceExhausted,
+        Operation::Background,
+        ProtocolStage::Maintenance,
+        None,
+        RetryAdvice::RetrySameInstance,
+    )
+}
+
+#[cfg(not(test))]
+struct DescriptorCleanupWorker {
+    sender: Option<SyncSender<()>>,
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+    runtime: Arc<RuntimeControl>,
+}
+
+#[cfg(not(test))]
+impl DescriptorCleanupWorker {
+    fn start(backend: Arc<FjallBackend>, runtime: Arc<RuntimeControl>) -> Result<Self> {
+        let (sender, receiver) = sync_channel(1);
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let worker_runtime = Arc::clone(&runtime);
+        let handle = thread::Builder::new()
+            .name("rustkv-descriptor-cleanup".to_owned())
+            .spawn(move || {
+                while receiver.recv().is_ok() {
+                    if worker_stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if worker_runtime.state().instance_state != InstanceState::Healthy {
+                        continue;
+                    }
+                    if let Err(error) = cleanup_descriptors_once(backend.as_ref(), &worker_stop) {
+                        latch_background_failure(&worker_runtime, &error);
+                    }
+                }
+            })
+            .map_err(background_spawn_error)?;
+        Ok(Self {
+            sender: Some(sender),
+            stop,
+            handle: Some(handle),
+            runtime,
+        })
+    }
+
+    fn trigger(&self) {
+        let Some(sender) = self.sender.as_ref() else {
+            return;
+        };
+        match sender.try_send(()) {
+            Ok(()) | Err(TrySendError::Full(())) => {}
+            Err(TrySendError::Disconnected(())) => {
+                let error = background_worker_stopped_error();
+                self.runtime.latch_failure(InstanceState::Poisoned, &error);
+            }
+        }
+    }
+}
+
+#[cfg(not(test))]
+impl Drop for DescriptorCleanupWorker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        self.sender.take();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+pub(crate) fn background_failure_target(error: &StorageError) -> Option<InstanceState> {
+    // The final retry advice carries the apply-state decision. In particular,
+    // an Unknown cleanup commit is always mapped to ReopenAndVerify and must
+    // not become retryable merely because its source kind is Busy or
+    // ResourceExhausted.
+    if error.retry_advice == RetryAdvice::RetrySameInstance {
+        return None;
+    }
+    Some(if error.kind == StorageErrorKind::StorageWriteStopped {
+        InstanceState::WriteStopped
+    } else {
+        InstanceState::Poisoned
+    })
+}
+
+#[cfg(not(test))]
+fn latch_background_failure(runtime: &RuntimeControl, error: &StorageError) {
+    if let Some(target) = background_failure_target(error) {
+        runtime.latch_failure(target, error);
+    }
+}
+
+#[cfg(not(test))]
+fn background_spawn_error(error: io::Error) -> StorageError {
+    let mut mapped = StorageError::codec_error(
+        StorageErrorKind::ResourceExhausted,
+        Operation::Open,
+        ProtocolStage::Lifecycle,
+        None,
+        RetryAdvice::RetrySameInstance,
+    );
+    mapped.os_code = error.raw_os_error();
+    mapped
+}
+
+#[cfg(not(test))]
+fn background_worker_stopped_error() -> StorageError {
+    StorageError::codec_error(
+        StorageErrorKind::StoragePoisoned,
+        Operation::Background,
+        ProtocolStage::Maintenance,
+        None,
+        RetryAdvice::ReopenAndVerify,
+    )
+}
+
 #[cfg(not(test))]
 type LiveCommitCoordinator = CommitCoordinator<LateBoundFjallBackend, OsTxUuidSource>;
 
@@ -675,6 +1113,7 @@ type LiveCommitCoordinator = CommitCoordinator<LateBoundFjallBackend, OsTxUuidSo
 struct LiveComponents {
     // The lifecycle controller closes admission before protocol resources are
     // released. RootLock remains last and therefore outlives every component.
+    cleanup: DescriptorCleanupWorker,
     lifecycle: Arc<LifecycleController>,
     runtime: Arc<RuntimeControl>,
     coordinator: Arc<LiveCommitCoordinator>,
@@ -1061,21 +1500,14 @@ impl Db {
             head_vlog_end,
         )?);
         let (lifecycle, lease) = LifecycleController::new_with_external_lease();
+        if !lifecycle.bind_runtime(Arc::clone(&runtime)) {
+            return Err(lifecycle_binding_error());
+        }
         let read_path = ReadPath {
             runtime: Arc::clone(&runtime) as Arc<dyn ReadRuntime>,
             index: Arc::clone(&index_binding) as Arc<dyn UserIndexReader>,
             values: reader as Arc<dyn ValueReader>,
         };
-        let inner = Arc::new(DbInner {
-            read_path,
-            live: LiveComponents {
-                lifecycle,
-                runtime,
-                coordinator,
-                _options: Arc::new(copy_options(options)),
-                _root_lock: root_lock,
-            },
-        });
 
         // Recovery and the complete Healthy runtime are now assembled against
         // the one-shot index binding. Only at this point may Fjall start its
@@ -1088,8 +1520,22 @@ impl Db {
         )?);
         validate_final_identity(&index, &format)?;
         index_binding
-            .bind(index)
+            .bind(Arc::clone(&index))
             .map_err(|_| late_bound_index_error())?;
+
+        let cleanup = DescriptorCleanupWorker::start(index, Arc::clone(&runtime))?;
+        let inner = Arc::new(DbInner {
+            read_path,
+            live: LiveComponents {
+                cleanup,
+                lifecycle,
+                runtime,
+                coordinator,
+                _options: Arc::new(copy_options(options)),
+                _root_lock: root_lock,
+            },
+        });
+        inner.live.cleanup.trigger();
 
         Ok(Self { lease, inner })
     }
@@ -1112,7 +1558,11 @@ impl Db {
             .runtime
             .check_write_admission(Operation::Put)?;
         let write = preflight_put(key, value, options.sync)?;
-        self.inner.live.coordinator.commit_nonempty(&write)
+        let result = self.inner.live.coordinator.commit_nonempty(&write);
+        if result.is_ok() && options.sync {
+            self.inner.live.cleanup.trigger();
+        }
+        result
     }
 
     #[cfg(test)]
@@ -1137,7 +1587,11 @@ impl Db {
             .runtime
             .check_write_admission(Operation::Delete)?;
         let write = preflight_delete(key, options.sync)?;
-        self.inner.live.coordinator.commit_nonempty(&write)
+        let result = self.inner.live.coordinator.commit_nonempty(&write);
+        if result.is_ok() && options.sync {
+            self.inner.live.cleanup.trigger();
+        }
+        result
     }
 
     #[cfg(test)]
@@ -1152,14 +1606,24 @@ impl Db {
     pub fn write(&self, options: &WriteOptions, batch: &WriteBatch) -> Result<()> {
         let _operation = self.begin_operation(Operation::WriteBatch)?;
         if batch.is_empty() {
-            return self.inner.live.coordinator.commit_empty_batch(options.sync);
+            let durable_before = self.inner.live.coordinator.state_snapshot().durable_seq;
+            let result = self.inner.live.coordinator.commit_empty_batch(options.sync);
+            let durable_after = self.inner.live.coordinator.state_snapshot().durable_seq;
+            if result.is_ok() && options.sync && durable_after > durable_before {
+                self.inner.live.cleanup.trigger();
+            }
+            return result;
         }
         self.inner
             .live
             .runtime
             .check_write_admission(Operation::WriteBatch)?;
         let write = preflight_batch(batch, options.sync)?;
-        self.inner.live.coordinator.commit_nonempty(&write)
+        let result = self.inner.live.coordinator.commit_nonempty(&write);
+        if result.is_ok() && options.sync {
+            self.inner.live.cleanup.trigger();
+        }
+        result
     }
 
     #[cfg(test)]
@@ -1289,18 +1753,873 @@ impl Db {
     }
 
     pub fn destroy(path: impl AsRef<Path>, options: &Options) -> Result<()> {
-        let _ = (path.as_ref(), options);
-        Err(StorageError::unsupported(
-            Operation::Destroy,
-            ProtocolStage::Lifecycle,
-            None,
-        ))
+        destroy_database(path.as_ref(), options, DestroyFaultPoint::None)
     }
 
     #[cfg(not(test))]
     fn begin_operation(&self, operation: Operation) -> Result<PublicOperationGuard> {
         self.inner.begin_operation(operation)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DestroyFaultPoint {
+    None,
+    Inventory,
+    DatabaseIdentity,
+    VLogFileRemove,
+    VLogDirectorySync,
+    VLogDirectoryRemove,
+    VLogRootSync,
+    IndexRemove,
+    #[cfg(test)]
+    IndexRemoveAfterEntry,
+    IndexRootSync,
+    FormatTemporaryRemove,
+    FormatTemporarySync,
+    FormatRemove,
+    FormatSync,
+    #[cfg(test)]
+    EmptyInventoryRootSync,
+}
+
+struct DestroyInventory {
+    format: Option<FormatMetadataV0>,
+    temporary_format: Option<FormatMetadataV0>,
+    index_present: bool,
+    vlog_present: bool,
+    vlog_files: Vec<VLogInventoryEntry>,
+}
+
+#[cfg(test)]
+pub(crate) fn destroy_with_fault_for_test(
+    path: &Path,
+    options: &Options,
+    fault: DestroyFaultPoint,
+) -> Result<()> {
+    destroy_database(path, options, fault)
+}
+
+fn destroy_database(path: &Path, options: &Options, fault: DestroyFaultPoint) -> Result<()> {
+    let root = match RootLock::acquire(path, false) {
+        Ok(Some(root)) => root,
+        Ok(None) => return Ok(()),
+        Err(error) => {
+            return Err(destroy_failure(
+                error,
+                ManagedObject::Lock,
+                DestroyStage::AcquireLock,
+                false,
+            ));
+        }
+    };
+    inject_destroy_fault(
+        fault,
+        DestroyFaultPoint::Inventory,
+        ManagedObject::Format,
+        DestroyStage::Inventory,
+        false,
+    )?;
+    let inventory = inventory_for_destroy(&root, options, fault)?;
+    if inventory.format.is_none() && inventory.temporary_format.is_none() {
+        #[cfg(test)]
+        inject_destroy_fault(
+            fault,
+            DestroyFaultPoint::EmptyInventoryRootSync,
+            ManagedObject::Format,
+            DestroyStage::SyncDirectory,
+            false,
+        )?;
+        root.sync_root().map_err(|error| {
+            destroy_failure(
+                error,
+                ManagedObject::Format,
+                DestroyStage::SyncDirectory,
+                false,
+            )
+        })?;
+        return Ok(());
+    }
+    let mut partially_deleted = false;
+
+    if inventory.vlog_present {
+        let vlog_path = root.child_path(VLOG_DIRECTORY_NAME).map_err(|error| {
+            destroy_failure(
+                error,
+                ManagedObject::VLogDirectory,
+                DestroyStage::Inventory,
+                partially_deleted,
+            )
+        })?;
+        let directory = VLogDirectory::open(&vlog_path).map_err(|error| {
+            destroy_failure(
+                error,
+                ManagedObject::VLogDirectory,
+                DestroyStage::Inventory,
+                partially_deleted,
+            )
+        })?;
+        for entry in inventory.vlog_files.iter().rev() {
+            inject_destroy_fault(
+                fault,
+                DestroyFaultPoint::VLogFileRemove,
+                ManagedObject::VLogFile {
+                    file_id: entry.file_id,
+                },
+                DestroyStage::RemoveFile,
+                partially_deleted,
+            )?;
+            directory
+                .remove_file_for_destroy(entry.file_id)
+                .map_err(|error| {
+                    destroy_io_failure(
+                        error,
+                        ManagedObject::VLogFile {
+                            file_id: entry.file_id,
+                        },
+                        DestroyStage::RemoveFile,
+                        partially_deleted,
+                    )
+                })?;
+            partially_deleted = true;
+        }
+        inject_destroy_fault(
+            fault,
+            DestroyFaultPoint::VLogDirectorySync,
+            ManagedObject::VLogDirectory,
+            DestroyStage::SyncDirectory,
+            partially_deleted,
+        )?;
+        directory.sync().map_err(|error| {
+            destroy_io_failure(
+                error,
+                ManagedObject::VLogDirectory,
+                DestroyStage::SyncDirectory,
+                partially_deleted,
+            )
+        })?;
+        drop(directory);
+
+        inject_destroy_fault(
+            fault,
+            DestroyFaultPoint::VLogDirectoryRemove,
+            ManagedObject::VLogDirectory,
+            DestroyStage::RemoveTree,
+            partially_deleted,
+        )?;
+        if root
+            .remove_empty_directory_tracked(VLOG_DIRECTORY_NAME)
+            .map_err(|error| {
+                destroy_failure(
+                    error,
+                    ManagedObject::VLogDirectory,
+                    DestroyStage::RemoveTree,
+                    partially_deleted,
+                )
+            })?
+        {
+            partially_deleted = true;
+        }
+        inject_destroy_fault(
+            fault,
+            DestroyFaultPoint::VLogRootSync,
+            ManagedObject::VLogDirectory,
+            DestroyStage::SyncDirectory,
+            partially_deleted,
+        )?;
+        root.sync_root().map_err(|error| {
+            destroy_failure(
+                error,
+                ManagedObject::VLogDirectory,
+                DestroyStage::SyncDirectory,
+                partially_deleted,
+            )
+        })?;
+    } else if inventory.index_present {
+        // Absence alone does not prove that a prior VLog unlink, if any, is
+        // durable. Reissue that barrier before beginning the next destructive
+        // stage so a crash cannot resurrect VLog beside a partially deleted
+        // index.
+        inject_destroy_fault(
+            fault,
+            DestroyFaultPoint::VLogRootSync,
+            ManagedObject::VLogDirectory,
+            DestroyStage::SyncDirectory,
+            partially_deleted,
+        )?;
+        root.sync_root().map_err(|error| {
+            destroy_failure(
+                error,
+                ManagedObject::VLogDirectory,
+                DestroyStage::SyncDirectory,
+                partially_deleted,
+            )
+        })?;
+    }
+
+    if inventory.index_present {
+        inject_destroy_fault(
+            fault,
+            DestroyFaultPoint::IndexRemove,
+            ManagedObject::IndexDirectory,
+            DestroyStage::RemoveTree,
+            partially_deleted,
+        )?;
+        #[cfg(test)]
+        let index_removal = if fault == DestroyFaultPoint::IndexRemoveAfterEntry {
+            root.remove_directory_tree_with_midway_failure_for_test(
+                INDEX_DIRECTORY_NAME,
+                &mut partially_deleted,
+            )
+        } else {
+            root.remove_directory_tree_tracked(INDEX_DIRECTORY_NAME, &mut partially_deleted)
+        };
+        #[cfg(not(test))]
+        let index_removal =
+            root.remove_directory_tree_tracked(INDEX_DIRECTORY_NAME, &mut partially_deleted);
+        index_removal.map_err(|error| {
+            destroy_failure(
+                error,
+                ManagedObject::IndexDirectory,
+                DestroyStage::RemoveTree,
+                partially_deleted,
+            )
+        })?;
+        inject_destroy_fault(
+            fault,
+            DestroyFaultPoint::IndexRootSync,
+            ManagedObject::IndexDirectory,
+            DestroyStage::SyncDirectory,
+            partially_deleted,
+        )?;
+        root.sync_root().map_err(|error| {
+            destroy_failure(
+                error,
+                ManagedObject::IndexDirectory,
+                DestroyStage::SyncDirectory,
+                partially_deleted,
+            )
+        })?;
+    } else {
+        // As above, absence alone does not prove that the index unlink is
+        // durable. Confirm the prior stage before removing either FORMAT
+        // marker, which is the last evidence needed for safe Destroy reentry.
+        inject_destroy_fault(
+            fault,
+            DestroyFaultPoint::IndexRootSync,
+            ManagedObject::IndexDirectory,
+            DestroyStage::SyncDirectory,
+            partially_deleted,
+        )?;
+        root.sync_root().map_err(|error| {
+            destroy_failure(
+                error,
+                ManagedObject::IndexDirectory,
+                DestroyStage::SyncDirectory,
+                partially_deleted,
+            )
+        })?;
+    }
+
+    if inventory.temporary_format.is_some() {
+        remove_destroy_format(&root, fault, true, &mut partially_deleted)?;
+    }
+    if inventory.format.is_some() {
+        remove_destroy_format(&root, fault, false, &mut partially_deleted)?;
+    }
+    Ok(())
+}
+
+fn remove_destroy_format(
+    root: &RootLock,
+    fault: DestroyFaultPoint,
+    temporary: bool,
+    partially_deleted: &mut bool,
+) -> Result<()> {
+    let (name, object, remove_fault, sync_fault) = if temporary {
+        (
+            FORMAT_TEMP_FILE_NAME,
+            ManagedObject::FormatTemporary,
+            DestroyFaultPoint::FormatTemporaryRemove,
+            DestroyFaultPoint::FormatTemporarySync,
+        )
+    } else {
+        (
+            FORMAT_FILE_NAME,
+            ManagedObject::Format,
+            DestroyFaultPoint::FormatRemove,
+            DestroyFaultPoint::FormatSync,
+        )
+    };
+    inject_destroy_fault(
+        fault,
+        remove_fault,
+        object,
+        DestroyStage::RemoveFile,
+        *partially_deleted,
+    )?;
+    let object = if temporary {
+        ManagedObject::FormatTemporary
+    } else {
+        ManagedObject::Format
+    };
+    if root.remove_regular_child_tracked(name).map_err(|error| {
+        destroy_failure(error, object, DestroyStage::RemoveFile, *partially_deleted)
+    })? {
+        *partially_deleted = true;
+    }
+    let object = if temporary {
+        ManagedObject::FormatTemporary
+    } else {
+        ManagedObject::Format
+    };
+    inject_destroy_fault(
+        fault,
+        sync_fault,
+        object,
+        DestroyStage::SyncDirectory,
+        *partially_deleted,
+    )?;
+    let object = if temporary {
+        ManagedObject::FormatTemporary
+    } else {
+        ManagedObject::Format
+    };
+    root.sync_root().map_err(|error| {
+        destroy_failure(
+            error,
+            object,
+            DestroyStage::SyncDirectory,
+            *partially_deleted,
+        )
+    })
+}
+
+fn inventory_for_destroy(
+    root: &RootLock,
+    options: &Options,
+    fault: DestroyFaultPoint,
+) -> Result<DestroyInventory> {
+    let format_kind = root.inspect_child(FORMAT_FILE_NAME).map_err(|error| {
+        destroy_failure(error, ManagedObject::Format, DestroyStage::Inventory, false)
+    })?;
+    let temporary_kind = root.inspect_child(FORMAT_TEMP_FILE_NAME).map_err(|error| {
+        destroy_failure(
+            error,
+            ManagedObject::FormatTemporary,
+            DestroyStage::Inventory,
+            false,
+        )
+    })?;
+    validate_destroy_file_kind(format_kind, ManagedObject::Format)?;
+    validate_destroy_file_kind(temporary_kind, ManagedObject::FormatTemporary)?;
+    if !matches!(format_kind, ManagedEntryKind::Missing)
+        && !matches!(temporary_kind, ManagedEntryKind::Missing)
+    {
+        return Err(destroy_layout_failure(
+            ManagedObject::FormatTemporary,
+            DestroyStage::Inventory,
+            false,
+        ));
+    }
+
+    let format = read_format(root, false).map_err(|error| {
+        destroy_failure(error, ManagedObject::Format, DestroyStage::Inventory, false)
+    })?;
+    let temporary_format = read_format(root, true).map_err(|error| {
+        destroy_failure(
+            error,
+            ManagedObject::FormatTemporary,
+            DestroyStage::Inventory,
+            false,
+        )
+    })?;
+    let index_kind = root.inspect_child(INDEX_DIRECTORY_NAME).map_err(|error| {
+        destroy_failure(
+            error,
+            ManagedObject::IndexDirectory,
+            DestroyStage::Inventory,
+            false,
+        )
+    })?;
+    let vlog_kind = root.inspect_child(VLOG_DIRECTORY_NAME).map_err(|error| {
+        destroy_failure(
+            error,
+            ManagedObject::VLogDirectory,
+            DestroyStage::Inventory,
+            false,
+        )
+    })?;
+    let index_present = validate_destroy_directory_kind(index_kind, ManagedObject::IndexDirectory)?;
+    let vlog_present = validate_destroy_directory_kind(vlog_kind, ManagedObject::VLogDirectory)?;
+
+    if format.is_none() && temporary_format.is_none() {
+        if index_present {
+            return Err(destroy_layout_failure(
+                ManagedObject::IndexDirectory,
+                DestroyStage::Inventory,
+                false,
+            ));
+        }
+        if vlog_present {
+            return Err(destroy_layout_failure(
+                ManagedObject::VLogDirectory,
+                DestroyStage::Inventory,
+                false,
+            ));
+        }
+        return Ok(DestroyInventory {
+            format,
+            temporary_format,
+            index_present,
+            vlog_present,
+            vlog_files: Vec::new(),
+        });
+    }
+
+    if index_present {
+        validate_destroy_index(
+            root,
+            options,
+            format.as_ref(),
+            temporary_format.as_ref(),
+            format.is_some() && !vlog_present,
+            fault,
+        )?;
+    } else if format.is_some() && vlog_present {
+        return Err(destroy_corruption_failure(
+            ManagedObject::DatabaseIdentity,
+            DestroyStage::Inventory,
+            false,
+        ));
+    }
+
+    let vlog_files = if vlog_present {
+        if temporary_format.is_some() {
+            if destroy_directory_has_entries(
+                root,
+                VLOG_DIRECTORY_NAME,
+                ManagedObject::VLogDirectory,
+            )? {
+                return Err(destroy_layout_failure(
+                    ManagedObject::VLogDirectory,
+                    DestroyStage::Inventory,
+                    false,
+                ));
+            }
+            Vec::new()
+        } else {
+            inventory_vlog_for_destroy(
+                root,
+                format.as_ref().ok_or_else(|| {
+                    destroy_layout_failure(ManagedObject::Format, DestroyStage::Inventory, false)
+                })?,
+            )?
+        }
+    } else {
+        Vec::new()
+    };
+
+    Ok(DestroyInventory {
+        format,
+        temporary_format,
+        index_present,
+        vlog_present,
+        vlog_files,
+    })
+}
+
+fn validate_destroy_index(
+    root: &RootLock,
+    options: &Options,
+    format: Option<&FormatMetadataV0>,
+    temporary_format: Option<&FormatMetadataV0>,
+    allow_partially_deleted_index: bool,
+    fault: DestroyFaultPoint,
+) -> Result<()> {
+    let index_path = root.child_path(INDEX_DIRECTORY_NAME).map_err(|error| {
+        destroy_failure(
+            error,
+            ManagedObject::IndexDirectory,
+            DestroyStage::Inventory,
+            false,
+        )
+    })?;
+    validate_directory_tree_nofollow(&index_path).map_err(|error| {
+        destroy_failure(
+            error,
+            ManagedObject::IndexDirectory,
+            DestroyStage::Inventory,
+            false,
+        )
+    })?;
+    let is_empty =
+        !destroy_directory_has_entries(root, INDEX_DIRECTORY_NAME, ManagedObject::IndexDirectory)?;
+
+    if let Some(format) = format {
+        if is_empty && allow_partially_deleted_index {
+            return Ok(());
+        }
+        if is_empty {
+            return Err(destroy_corruption_failure(
+                ManagedObject::DatabaseIdentity,
+                DestroyStage::Inventory,
+                false,
+            ));
+        }
+        inject_destroy_fault(
+            fault,
+            DestroyFaultPoint::DatabaseIdentity,
+            ManagedObject::DatabaseIdentity,
+            DestroyStage::Inventory,
+            false,
+        )?;
+        let validation = FjallBackend::open_existing_read_only_for_destroy(
+            &index_path,
+            options.fjall_index_options(),
+        )
+        .and_then(|verification| {
+            let result = validate_final_identity(verification.backend(), format);
+            let close = verification.close();
+            result.and(close)
+        });
+        match validation {
+            Ok(()) => {}
+            Err(error) if allow_partially_deleted_index => {
+                let _ = error;
+            }
+            Err(error) => {
+                return Err(destroy_failure(
+                    error,
+                    ManagedObject::DatabaseIdentity,
+                    DestroyStage::Inventory,
+                    false,
+                ));
+            }
+        }
+    } else if let Some(temporary) = temporary_format {
+        if is_empty {
+            return Ok(());
+        }
+        inject_destroy_fault(
+            fault,
+            DestroyFaultPoint::DatabaseIdentity,
+            ManagedObject::DatabaseIdentity,
+            DestroyStage::Inventory,
+            false,
+        )?;
+        let validation = FjallBackend::open_existing_read_only_for_destroy(
+            &index_path,
+            options.fjall_index_options(),
+        )
+        .and_then(|verification| {
+            let result = validate_interrupted_index(verification.backend(), temporary);
+            let close = verification.close();
+            result.and(close)
+        });
+        match validation {
+            Ok(()) => {}
+            Err(error) if allow_partially_deleted_index => {
+                let _ = error;
+            }
+            Err(error) => {
+                return Err(destroy_failure(
+                    error,
+                    ManagedObject::DatabaseIdentity,
+                    DestroyStage::Inventory,
+                    false,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn destroy_directory_has_entries(
+    root: &RootLock,
+    name: &str,
+    object: ManagedObject,
+) -> Result<bool> {
+    root.read_directory(name)
+        .and_then(|mut entries| entries.next().transpose().map_err(open_io_error))
+        .map(|entry| entry.is_some())
+        .map_err(|error| destroy_failure(error, object, DestroyStage::Inventory, false))
+}
+
+fn inventory_vlog_for_destroy(
+    root: &RootLock,
+    format: &FormatMetadataV0,
+) -> Result<Vec<VLogInventoryEntry>> {
+    let path = root.child_path(VLOG_DIRECTORY_NAME).map_err(|error| {
+        destroy_failure(
+            error,
+            ManagedObject::VLogDirectory,
+            DestroyStage::Inventory,
+            false,
+        )
+    })?;
+    let directory = VLogDirectory::open(&path).map_err(|error| {
+        destroy_failure(
+            error,
+            ManagedObject::VLogDirectory,
+            DestroyStage::Inventory,
+            false,
+        )
+    })?;
+    let mut files = Vec::new();
+    for entry in root.read_directory(VLOG_DIRECTORY_NAME).map_err(|error| {
+        destroy_failure(
+            error,
+            ManagedObject::VLogDirectory,
+            DestroyStage::Inventory,
+            false,
+        )
+    })? {
+        let entry = entry.map_err(|error| {
+            destroy_io_failure(
+                error,
+                ManagedObject::VLogDirectory,
+                DestroyStage::Inventory,
+                false,
+            )
+        })?;
+        let name = entry.file_name().into_string().map_err(|_| {
+            destroy_layout_failure(ManagedObject::VLogDirectory, DestroyStage::Inventory, false)
+        })?;
+        let file_id = parse_destroy_vlog_name(&name).ok_or_else(|| {
+            destroy_layout_failure(ManagedObject::VLogDirectory, DestroyStage::Inventory, false)
+        })?;
+        let file_type = entry.file_type().map_err(|error| {
+            destroy_io_failure(
+                error,
+                ManagedObject::VLogFile { file_id },
+                DestroyStage::Inventory,
+                false,
+            )
+        })?;
+        if !file_type.is_file() {
+            return Err(destroy_layout_failure(
+                ManagedObject::VLogFile { file_id },
+                DestroyStage::Inventory,
+                false,
+            ));
+        }
+        let file = directory.open_read_only(file_id).map_err(|error| {
+            destroy_io_failure(
+                error,
+                ManagedObject::VLogFile { file_id },
+                DestroyStage::Inventory,
+                false,
+            )
+        })?;
+        let len = file
+            .metadata()
+            .map_err(|error| {
+                destroy_io_failure(
+                    error,
+                    ManagedObject::VLogFile { file_id },
+                    DestroyStage::Inventory,
+                    false,
+                )
+            })?
+            .len();
+        let minimum_header_len =
+            u64::try_from(PAGE_HEADER_ENCODED_LEN + FILE_HEADER_ENCODED_LEN)
+                .map_err(|_| destroy_resource_failure(ManagedObject::VLogFile { file_id }))?;
+        if len > MAX_VLOG_FILE_SIZE || len < minimum_header_len {
+            return Err(destroy_corruption_failure(
+                ManagedObject::VLogFile { file_id },
+                DestroyStage::Inventory,
+                false,
+            ));
+        }
+
+        let mut page = [0_u8; PAGE_HEADER_ENCODED_LEN];
+        read_exact_at(&file, &mut page, 0, file_id).map_err(|error| {
+            destroy_failure(
+                error,
+                ManagedObject::VLogFile { file_id },
+                DestroyStage::Inventory,
+                false,
+            )
+        })?;
+        let page = PageHeader::decode(&page).map_err(|error| {
+            destroy_failure(
+                error,
+                ManagedObject::VLogFile { file_id },
+                DestroyStage::Inventory,
+                false,
+            )
+        })?;
+        let mut header = [0_u8; FILE_HEADER_ENCODED_LEN];
+        read_exact_at(&file, &mut header, PAGE_HEADER_ENCODED_LEN as u64, file_id).map_err(
+            |error| {
+                destroy_failure(
+                    error,
+                    ManagedObject::VLogFile { file_id },
+                    DestroyStage::Inventory,
+                    false,
+                )
+            },
+        )?;
+        let header = VLogFileHeader::decode(&header).map_err(|error| {
+            destroy_failure(
+                error,
+                ManagedObject::VLogFile { file_id },
+                DestroyStage::Inventory,
+                false,
+            )
+        })?;
+        if page.file_id != file_id
+            || page.page_no != 0
+            || header.file_id != file_id
+            || header.database_uuid != format.database_uuid
+            || header.format_version != format.format_version
+        {
+            return Err(destroy_corruption_failure(
+                ManagedObject::VLogFile { file_id },
+                DestroyStage::Inventory,
+                false,
+            ));
+        }
+        files
+            .try_reserve(1)
+            .map_err(|_| destroy_resource_failure(ManagedObject::VLogDirectory))?;
+        files.push(VLogInventoryEntry {
+            file_id,
+            len,
+            path: entry.path(),
+        });
+    }
+    files.sort_unstable_by_key(|entry| entry.file_id);
+    Ok(files)
+}
+
+fn parse_destroy_vlog_name(name: &str) -> Option<u32> {
+    let digits = name.strip_prefix('D')?.strip_suffix(".data")?;
+    if digits.len() != 6 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok().filter(|file_id| *file_id <= 999_999)
+}
+
+fn validate_destroy_file_kind(kind: ManagedEntryKind, object: ManagedObject) -> Result<()> {
+    if matches!(
+        kind,
+        ManagedEntryKind::Missing | ManagedEntryKind::RegularFile { .. }
+    ) {
+        Ok(())
+    } else {
+        Err(destroy_layout_failure(
+            object,
+            DestroyStage::Inventory,
+            false,
+        ))
+    }
+}
+
+fn validate_destroy_directory_kind(kind: ManagedEntryKind, object: ManagedObject) -> Result<bool> {
+    match kind {
+        ManagedEntryKind::Missing => Ok(false),
+        ManagedEntryKind::Directory => Ok(true),
+        _ => Err(destroy_layout_failure(
+            object,
+            DestroyStage::Inventory,
+            false,
+        )),
+    }
+}
+
+fn inject_destroy_fault(
+    actual: DestroyFaultPoint,
+    expected: DestroyFaultPoint,
+    object: ManagedObject,
+    stage: DestroyStage,
+    partially_deleted: bool,
+) -> Result<()> {
+    if actual == expected {
+        Err(destroy_io_failure(
+            io::Error::from_raw_os_error(5),
+            object,
+            stage,
+            partially_deleted,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn destroy_failure(
+    mut error: StorageError,
+    object: ManagedObject,
+    stage: DestroyStage,
+    partially_deleted: bool,
+) -> StorageError {
+    error.operation = Operation::Destroy;
+    error.protocol_stage = ProtocolStage::Lifecycle;
+    error.write_outcome = None;
+    error.instance_state = None;
+    error.retry_advice = retry_advice_for(error.kind);
+    error.destroy_failure = Some(DestroyFailureContext {
+        failed_object: object,
+        stage,
+        partially_deleted,
+        os_code: error.os_code,
+    });
+    error
+}
+
+fn destroy_io_failure(
+    error: io::Error,
+    object: ManagedObject,
+    stage: DestroyStage,
+    partially_deleted: bool,
+) -> StorageError {
+    let mut mapped = StorageError::codec_error(
+        StorageErrorKind::Io,
+        Operation::Destroy,
+        ProtocolStage::Lifecycle,
+        None,
+        RetryAdvice::FixEnvironmentAndReopen,
+    );
+    mapped.os_code = error.raw_os_error();
+    destroy_failure(mapped, object, stage, partially_deleted)
+}
+
+fn destroy_layout_failure(
+    object: ManagedObject,
+    stage: DestroyStage,
+    partially_deleted: bool,
+) -> StorageError {
+    destroy_failure(layout_error(), object, stage, partially_deleted)
+}
+
+fn destroy_corruption_failure(
+    object: ManagedObject,
+    stage: DestroyStage,
+    partially_deleted: bool,
+) -> StorageError {
+    destroy_failure(
+        metadata_error(StorageErrorKind::Corruption),
+        object,
+        stage,
+        partially_deleted,
+    )
+}
+
+fn destroy_resource_failure(object: ManagedObject) -> StorageError {
+    destroy_failure(
+        StorageError::codec_error(
+            StorageErrorKind::ResourceExhausted,
+            Operation::Destroy,
+            ProtocolStage::Lifecycle,
+            None,
+            RetryAdvice::RetrySameInstance,
+        ),
+        object,
+        DestroyStage::Inventory,
+        false,
+    )
 }
 
 #[cfg(not(test))]
@@ -1409,6 +2728,17 @@ fn lifecycle_admission_error(operation: Operation, state: InstanceState) -> Stor
 
 #[cfg(not(test))]
 fn late_bound_index_error() -> StorageError {
+    StorageError::codec_error(
+        StorageErrorKind::StoragePoisoned,
+        Operation::Open,
+        ProtocolStage::Lifecycle,
+        None,
+        RetryAdvice::ReopenAndVerify,
+    )
+}
+
+#[cfg(not(test))]
+fn lifecycle_binding_error() -> StorageError {
     StorageError::codec_error(
         StorageErrorKind::StoragePoisoned,
         Operation::Open,

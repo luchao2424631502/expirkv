@@ -117,6 +117,22 @@ impl RuntimeControl {
         Ok(WriteTicket::new(Arc::clone(self), request))
     }
 
+    /// Permanently closes write admission for lifecycle shutdown without
+    /// changing the public instance state or its first latched error.
+    pub(crate) fn close_write_admission(&self) {
+        let (state, cancelled) = {
+            let mut gate = lock_gate(&self.gate);
+            gate.accepting_writes = false;
+            (
+                self.state().instance_state,
+                std::mem::take(&mut gate.ordered_queue),
+            )
+        };
+        for request in cancelled {
+            request.cancel_for_state(state);
+        }
+    }
+
     pub(crate) fn required_failure_state(
         &self,
         target: InstanceState,
@@ -293,6 +309,11 @@ impl RuntimeControl {
     #[cfg(test)]
     pub(crate) fn queued_write_count_for_test(&self) -> usize {
         lock_gate(&self.gate).ordered_queue.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn accepting_writes_for_test(&self) -> bool {
+        lock_gate(&self.gate).accepting_writes
     }
 
     fn publish_stats(&self, snapshot: StateSnapshot) {

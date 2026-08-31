@@ -219,21 +219,74 @@ impl RootLock {
     }
 
     pub(crate) fn remove_regular_child_if_present(&self, name: &str) -> Result<()> {
+        self.remove_regular_child_tracked(name).map(|_| ())
+    }
+
+    pub(crate) fn remove_regular_child_tracked(&self, name: &str) -> Result<bool> {
         let path = self.checked_child_path(name)?;
         match self.inspect_child(name)? {
-            ManagedEntryKind::Missing => Ok(()),
-            ManagedEntryKind::RegularFile { .. } => fs::remove_file(path).map_err(open_io_error),
+            ManagedEntryKind::Missing => Ok(false),
+            ManagedEntryKind::RegularFile { .. } => {
+                fs::remove_file(path).map_err(open_io_error)?;
+                Ok(true)
+            }
             _ => Err(layout_error()),
         }
     }
 
     pub(crate) fn remove_directory_tree_if_present(&self, name: &str) -> Result<()> {
+        let mut partially_deleted = false;
+        self.remove_directory_tree_tracked(name, &mut partially_deleted)
+    }
+
+    pub(crate) fn remove_directory_tree_tracked(
+        &self,
+        name: &str,
+        partially_deleted: &mut bool,
+    ) -> Result<()> {
+        self.remove_directory_tree_tracked_inner(name, partially_deleted, false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remove_directory_tree_with_midway_failure_for_test(
+        &self,
+        name: &str,
+        partially_deleted: &mut bool,
+    ) -> Result<()> {
+        self.remove_directory_tree_tracked_inner(name, partially_deleted, true)
+    }
+
+    fn remove_directory_tree_tracked_inner(
+        &self,
+        name: &str,
+        partially_deleted: &mut bool,
+        fail_after_first_removal: bool,
+    ) -> Result<()> {
         let path = self.checked_child_path(name)?;
         match self.inspect_child(name)? {
             ManagedEntryKind::Missing => Ok(()),
-            ManagedEntryKind::Directory => fs::remove_dir_all(path).map_err(open_io_error),
+            ManagedEntryKind::Directory => {
+                remove_directory_tree_nofollow(&path, partially_deleted, fail_after_first_removal)
+                    .map_err(open_io_error)
+            }
             _ => Err(layout_error()),
         }
+    }
+
+    pub(crate) fn remove_empty_directory_tracked(&self, name: &str) -> Result<bool> {
+        let path = self.checked_child_path(name)?;
+        match self.inspect_child(name)? {
+            ManagedEntryKind::Missing => Ok(false),
+            ManagedEntryKind::Directory => {
+                fs::remove_dir(path).map_err(open_io_error)?;
+                Ok(true)
+            }
+            _ => Err(layout_error()),
+        }
+    }
+
+    pub(crate) fn child_path(&self, name: &str) -> Result<PathBuf> {
+        self.checked_child_path(name)
     }
 
     fn checked_child_path(&self, name: &str) -> Result<PathBuf> {
@@ -255,6 +308,62 @@ impl RootLock {
         }
         Ok(())
     }
+}
+
+pub(crate) fn validate_directory_tree_nofollow(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path).map_err(open_io_error)?;
+    if !metadata.file_type().is_dir() {
+        return Err(layout_error());
+    }
+    for entry in fs::read_dir(path).map_err(open_io_error)? {
+        let entry = entry.map_err(open_io_error)?;
+        let file_type = entry.file_type().map_err(open_io_error)?;
+        if file_type.is_dir() {
+            validate_directory_tree_nofollow(&entry.path())?;
+        } else if !file_type.is_file() && !file_type.is_symlink() {
+            return Err(layout_error());
+        }
+    }
+    Ok(())
+}
+
+fn remove_directory_tree_nofollow(
+    path: &Path,
+    partially_deleted: &mut bool,
+    fail_after_first_removal: bool,
+) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "managed tree root is not a directory",
+        ));
+    }
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let child = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            remove_directory_tree_nofollow(&child, partially_deleted, fail_after_first_removal)?;
+        } else if file_type.is_file() || file_type.is_symlink() {
+            fs::remove_file(child)?;
+            *partially_deleted = true;
+            if fail_after_first_removal {
+                return Err(io::Error::from_raw_os_error(5));
+            }
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unsupported object inside managed directory tree",
+            ));
+        }
+    }
+    fs::remove_dir(path)?;
+    *partially_deleted = true;
+    if fail_after_first_removal {
+        return Err(io::Error::from_raw_os_error(5));
+    }
+    Ok(())
 }
 
 impl Drop for RootLock {

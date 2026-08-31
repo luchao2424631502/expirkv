@@ -1,12 +1,14 @@
 //! Fjall 3.1.8 index-backend adapter.
 
 use std::error::Error as StdError;
+use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 use ::fjall::compaction::Leveled;
 use ::fjall::config::{BlockSizePolicy, CompressionPolicy, RestartIntervalPolicy};
@@ -38,6 +40,7 @@ const MIN_FJALL_BLOCK_SIZE: usize = 1_024;
 const MAX_FJALL_BLOCK_SIZE: usize = 4 * 1_024 * 1_024;
 // Fjall 3.1.8's default leveled strategy calculates L1 as target_size * 4.
 const MAX_FJALL_TABLE_TARGET_SIZE: u64 = u64::MAX / 4;
+static NEXT_READ_ONLY_SHADOW_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
 struct ValidatedOptions {
@@ -201,6 +204,100 @@ pub(crate) struct FjallBackend {
     iterator_error_after: Mutex<Option<usize>>,
 }
 
+/// A Destroy-only read view recovered inside an isolated shadow directory.
+///
+/// Fjall 3.1.8 has no side-effect-free open API: ordinary recovery may remove
+/// orphaned manifests, tables, or keyspaces. The shadow contains byte copies of
+/// regular files and omits unmanaged symlinks, so Fjall may recover the shadow
+/// while the locked source index remains read-only.
+pub(crate) struct FjallReadOnlyVerification {
+    // Field order is intentional: Fjall must release every shadow handle before
+    // the shadow tree is removed.
+    backend: FjallBackend,
+    shadow: ReadOnlyShadowDirectory,
+}
+
+impl FjallReadOnlyVerification {
+    pub(crate) fn backend(&self) -> &FjallBackend {
+        &self.backend
+    }
+
+    /// Closes Fjall first and reports failure to clean the isolated shadow while
+    /// Destroy is still in its non-destructive inventory phase.
+    pub(crate) fn close(self) -> Result<()> {
+        let Self {
+            backend,
+            mut shadow,
+        } = self;
+        drop(backend);
+        shadow.remove()
+    }
+}
+
+struct ReadOnlyShadowDirectory {
+    path: Option<PathBuf>,
+}
+
+impl ReadOnlyShadowDirectory {
+    fn create() -> Result<Self> {
+        let temporary_root = std::env::temp_dir();
+        let process_id = std::process::id();
+        for _ in 0..64 {
+            let nonce = NEXT_READ_ONLY_SHADOW_ID.fetch_add(1, Ordering::Relaxed);
+            let path = temporary_root.join(format!("rustkv-fjall-read-only-{process_id}-{nonce}"));
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(Self { path: Some(path) }),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(shadow_io_error(error)),
+            }
+        }
+        Err(shadow_io_error(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate a unique Fjall read-only shadow directory",
+        )))
+    }
+
+    fn path(&self) -> &Path {
+        self.path
+            .as_deref()
+            .expect("read-only shadow path exists until removal")
+    }
+
+    fn remove(&mut self) -> Result<()> {
+        self.remove_with(|path| fs::remove_dir_all(path))
+    }
+
+    fn remove_with(&mut self, remove: impl FnOnce(&Path) -> std::io::Result<()>) -> Result<()> {
+        let Some(path) = self.path.as_deref() else {
+            return Ok(());
+        };
+        remove(path).map_err(shadow_io_error)?;
+        self.path = None;
+        Ok(())
+    }
+}
+
+impl Drop for ReadOnlyShadowDirectory {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = fs::remove_dir_all(path);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn shadow_remove_retry_probe_for_test() -> Result<(StorageError, bool, bool)> {
+    let mut shadow = ReadOnlyShadowDirectory::create()?;
+    let path = shadow.path().to_path_buf();
+    fs::write(path.join("sentinel"), b"shadow must be removed by Drop").map_err(shadow_io_error)?;
+    let Err(error) = shadow.remove_with(|_| Err(io::Error::from_raw_os_error(5))) else {
+        return Err(open_layout_error());
+    };
+    let retained_after_failure = shadow.path.as_deref() == Some(path.as_path()) && path.is_dir();
+    drop(shadow);
+    Ok((error, retained_after_failure, path.exists()))
+}
+
 impl FjallBackend {
     /// Creates a new Fjall container and all three fixed keyspaces.
     ///
@@ -250,6 +347,27 @@ impl FjallBackend {
         let validated = validate_options(options)?;
         validate_existing_layout(path)?;
         Self::open(path, validated, true, BackgroundWorkerMode::Disabled)
+    }
+
+    /// Produces a side-effect-free read view for Destroy identity verification.
+    ///
+    /// The source is validated and copied into an isolated shadow before Fjall
+    /// recovery is invoked. Recovery can mutate only the shadow; it never opens
+    /// a writable handle to a regular file in the source index.
+    pub(crate) fn open_existing_read_only_for_destroy(
+        path: &Path,
+        options: FjallIndexOptions,
+    ) -> Result<FjallReadOnlyVerification> {
+        let validated = validate_options(options)?;
+        validate_existing_layout_for_destroy(path)?;
+        let shadow = copy_read_only_shadow(path)?;
+        let backend = Self::open(
+            shadow.path(),
+            validated,
+            true,
+            BackgroundWorkerMode::Disabled,
+        )?;
+        Ok(FjallReadOnlyVerification { backend, shadow })
     }
 
     fn open(
@@ -798,6 +916,14 @@ fn metadata_keyspace_options() -> KeyspaceCreateOptions {
 /// directories whose LSM `current` marker is absent. Validate the locked 3.1.8
 /// layout before handing the path to Fjall so damaged state fails closed.
 fn validate_existing_layout(path: &Path) -> Result<()> {
+    validate_existing_layout_inner(path, false)
+}
+
+fn validate_existing_layout_for_destroy(path: &Path) -> Result<()> {
+    validate_existing_layout_inner(path, true)
+}
+
+fn validate_existing_layout_inner(path: &Path, allow_unmanaged_symlinks: bool) -> Result<()> {
     require_directory(path, StorageErrorKind::InvalidLayout)?;
     require_regular_file(
         &path.join(FJALL_VERSION_MARKER),
@@ -814,6 +940,12 @@ fn validate_existing_layout(path: &Path) -> Result<()> {
         let Some(name) = name.to_str() else {
             return Err(open_layout_error());
         };
+        let file_type = entry
+            .file_type()
+            .map_err(|error| storage_error_from_io(error, Operation::Open))?;
+        if allow_unmanaged_symlinks && file_type.is_symlink() {
+            continue;
+        }
         if matches!(
             name,
             FJALL_VERSION_MARKER | FJALL_LOCK_FILE | FJALL_KEYSPACES_DIRECTORY
@@ -830,11 +962,7 @@ fn validate_existing_layout(path: &Path) -> Result<()> {
         if name != format!("{journal_id}.jnl") {
             return Err(open_layout_error());
         }
-        if !entry
-            .file_type()
-            .map_err(|error| storage_error_from_io(error, Operation::Open))?
-            .is_file()
-        {
+        if !file_type.is_file() {
             return Err(open_layout_error());
         }
         has_journal = true;
@@ -843,16 +971,25 @@ fn validate_existing_layout(path: &Path) -> Result<()> {
         return Err(open_corruption_error());
     }
 
-    validate_existing_keyspace_trees(&path.join(FJALL_KEYSPACES_DIRECTORY))
+    validate_existing_keyspace_trees(
+        &path.join(FJALL_KEYSPACES_DIRECTORY),
+        allow_unmanaged_symlinks,
+    )
 }
 
-fn validate_existing_keyspace_trees(path: &Path) -> Result<()> {
+fn validate_existing_keyspace_trees(path: &Path, allow_unmanaged_symlinks: bool) -> Result<()> {
     require_directory(path, StorageErrorKind::InvalidLayout)?;
     let mut found = [false; 4];
     let entries =
         std::fs::read_dir(path).map_err(|error| storage_error_from_io(error, Operation::Open))?;
     for entry in entries {
         let entry = entry.map_err(|error| storage_error_from_io(error, Operation::Open))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| storage_error_from_io(error, Operation::Open))?;
+        if allow_unmanaged_symlinks && file_type.is_symlink() {
+            continue;
+        }
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             return Err(open_layout_error());
         };
@@ -863,16 +1000,11 @@ fn validate_existing_keyspace_trees(path: &Path) -> Result<()> {
             "3" => 3,
             _ => return Err(open_layout_error()),
         };
-        if found[index]
-            || !entry
-                .file_type()
-                .map_err(|error| storage_error_from_io(error, Operation::Open))?
-                .is_dir()
-        {
+        if found[index] || !file_type.is_dir() {
             return Err(open_layout_error());
         }
         found[index] = true;
-        validate_existing_lsm_tree(&entry.path())?;
+        validate_existing_lsm_tree(&entry.path(), allow_unmanaged_symlinks)?;
     }
 
     if found.into_iter().all(|present| present) {
@@ -882,7 +1014,7 @@ fn validate_existing_keyspace_trees(path: &Path) -> Result<()> {
     }
 }
 
-fn validate_existing_lsm_tree(path: &Path) -> Result<()> {
+fn validate_existing_lsm_tree(path: &Path, allow_unmanaged_symlinks: bool) -> Result<()> {
     let current_path = path.join(FJALL_LSM_CURRENT_MARKER);
     require_regular_file(&current_path, StorageErrorKind::Corruption)?;
     let current = std::fs::read(&current_path)
@@ -900,7 +1032,7 @@ fn validate_existing_lsm_tree(path: &Path) -> Result<()> {
 
     let tables_path = path.join(FJALL_LSM_TABLES_DIRECTORY);
     require_directory(&tables_path, StorageErrorKind::Corruption)?;
-    validate_lsm_table_files(&tables_path)?;
+    validate_lsm_table_files(&tables_path, allow_unmanaged_symlinks)?;
 
     let entries =
         std::fs::read_dir(path).map_err(|error| storage_error_from_io(error, Operation::Open))?;
@@ -912,6 +1044,9 @@ fn validate_existing_lsm_tree(path: &Path) -> Result<()> {
         let file_type = entry
             .file_type()
             .map_err(|error| storage_error_from_io(error, Operation::Open))?;
+        if allow_unmanaged_symlinks && file_type.is_symlink() {
+            continue;
+        }
         match name.as_str() {
             FJALL_LSM_CURRENT_MARKER if file_type.is_file() => {}
             FJALL_LSM_TABLES_DIRECTORY if file_type.is_dir() => {}
@@ -928,16 +1063,18 @@ fn validate_existing_lsm_tree(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_lsm_table_files(path: &Path) -> Result<()> {
+fn validate_lsm_table_files(path: &Path, allow_unmanaged_symlinks: bool) -> Result<()> {
     let entries =
         std::fs::read_dir(path).map_err(|error| storage_error_from_io(error, Operation::Open))?;
     for entry in entries {
         let entry = entry.map_err(|error| storage_error_from_io(error, Operation::Open))?;
-        if !entry
+        let file_type = entry
             .file_type()
-            .map_err(|error| storage_error_from_io(error, Operation::Open))?
-            .is_file()
-        {
+            .map_err(|error| storage_error_from_io(error, Operation::Open))?;
+        if allow_unmanaged_symlinks && file_type.is_symlink() {
+            continue;
+        }
+        if !file_type.is_file() {
             return Err(open_layout_error());
         }
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
@@ -970,6 +1107,37 @@ fn require_directory(path: &Path, missing_kind: StorageErrorKind) -> Result<()> 
         }
         Err(error) => Err(storage_error_from_io(error, Operation::Open)),
     }
+}
+
+fn copy_read_only_shadow(source: &Path) -> Result<ReadOnlyShadowDirectory> {
+    let shadow = ReadOnlyShadowDirectory::create()?;
+    copy_directory_contents_nofollow(source, shadow.path())?;
+    Ok(shadow)
+}
+
+fn copy_directory_contents_nofollow(source: &Path, destination: &Path) -> Result<()> {
+    let entries = fs::read_dir(source).map_err(shadow_io_error)?;
+    for entry in entries {
+        let entry = entry.map_err(shadow_io_error)?;
+        let file_type = entry.file_type().map_err(shadow_io_error)?;
+        let destination_entry = destination.join(entry.file_name());
+        if file_type.is_dir() {
+            fs::create_dir(&destination_entry).map_err(shadow_io_error)?;
+            copy_directory_contents_nofollow(&entry.path(), &destination_entry)?;
+        } else if file_type.is_file() {
+            fs::copy(entry.path(), destination_entry).map_err(shadow_io_error)?;
+        } else if file_type.is_symlink() {
+            // Destroy inventories symlinks separately and unlinks them without
+            // traversal. They must not become inputs to Fjall shadow recovery.
+        } else {
+            return Err(open_layout_error());
+        }
+    }
+    Ok(())
+}
+
+fn shadow_io_error(error: io::Error) -> StorageError {
+    storage_error_from_io(error, Operation::Open)
 }
 
 fn validate_create_target(path: &Path) -> Result<()> {
