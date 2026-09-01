@@ -46,6 +46,62 @@ fn pinned_install_contains_headers_library_and_provenance() {
     assert_eq!(provenance, EXPECTED_PROVENANCE);
 }
 
+#[test]
+fn bootstrap_reuses_an_exact_complete_install_on_repeated_runs() {
+    let sandbox = TestDirectory::new("reusable-install");
+    let fake_crate = sandbox.path().join("fake-benchmark");
+    let scripts = fake_crate.join("scripts");
+    let install = fake_crate.join(".deps/leveldb-install");
+    std::fs::create_dir_all(&scripts).expect("fake scripts directory must be created");
+    std::fs::create_dir_all(install.join("include/leveldb"))
+        .expect("fake include directory must be created");
+    std::fs::create_dir_all(install.join("lib")).expect("fake lib directory must be created");
+    std::fs::create_dir_all(install.join("share/kv_bench"))
+        .expect("fake provenance directory must be created");
+
+    let copied_script = scripts.join("bootstrap_leveldb.sh");
+    std::fs::copy(
+        manifest_dir().join("scripts/bootstrap_leveldb.sh"),
+        &copied_script,
+    )
+    .expect("bootstrap script must be copied");
+    std::fs::write(install.join("include/leveldb/c.h"), "official C API")
+        .expect("fake C header must be written");
+    std::fs::write(
+        install.join("include/leveldb/db.h"),
+        "kMajorVersion = 1;\nkMinorVersion = 23;\n",
+    )
+    .expect("fake version header must be written");
+    std::fs::write(install.join("lib/libleveldb.a"), "static library")
+        .expect("fake library must be written");
+    std::fs::write(
+        install.join("share/kv_bench/leveldb-provenance.txt"),
+        EXPECTED_PROVENANCE,
+    )
+    .expect("frozen provenance must be written");
+    std::fs::write(install.join("untouched-marker"), "preserve me")
+        .expect("marker must be written");
+
+    for _ in 0..2 {
+        let output = Command::new("sh")
+            .arg(&copied_script)
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .expect("bootstrap subprocess must start");
+        assert!(output.status.success());
+        assert!(
+            String::from_utf8(output.stdout)
+                .expect("bootstrap stdout must be UTF-8")
+                .contains("already bootstrapped")
+        );
+        assert_eq!(
+            std::fs::read_to_string(install.join("untouched-marker"))
+                .expect("marker must survive reuse"),
+            "preserve me"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn bootstrap_rejects_a_symlinked_deps_directory_without_touching_its_target() {
@@ -184,7 +240,7 @@ fn bootstrap_does_not_reuse_provenance_with_extra_bytes() {
 fn help_and_version_are_successful() {
     let help = run(&["--help"]);
     assert!(help.status.success());
-    let help_stdout = String::from_utf8(help.stdout).expect("help output must be UTF-8");
+    let help_stdout = std::str::from_utf8(&help.stdout).expect("help output must be UTF-8");
     assert!(help_stdout.contains("Usage:"));
     assert!(help_stdout.contains("kv_bench --help"));
     assert!(help_stdout.contains("not implemented in stage B0"));
@@ -192,11 +248,19 @@ fn help_and_version_are_successful() {
     let version = run(&["--version"]);
     assert!(version.status.success());
     assert_eq!(
-        String::from_utf8(version.stdout)
+        std::str::from_utf8(&version.stdout)
             .expect("version output must be UTF-8")
             .trim(),
         "kv_bench 0.1.0 (LevelDB 1.23)"
     );
+
+    let short_help = run(&["-h"]);
+    assert!(short_help.status.success());
+    assert_eq!(short_help.stdout, help.stdout);
+
+    let short_version = run(&["-V"]);
+    assert!(short_version.status.success());
+    assert_eq!(short_version.stdout, version.stdout);
 }
 
 #[test]

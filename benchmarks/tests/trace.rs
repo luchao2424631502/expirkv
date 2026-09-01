@@ -28,6 +28,52 @@ fn splitmix64_and_unbiased_bounded_sampling_have_golden_outputs() {
     );
     assert!((0..1_000).all(|_| bounded.uniform_below(7) < 7));
     assert!((0..32).all(|_| bounded.uniform_below(1) == 0));
+    assert!(
+        std::panic::catch_unwind(|| SplitMix64::new(1).uniform_below(0)).is_err(),
+        "a zero sampling bound must never be silently accepted"
+    );
+
+    assert!(deterministic_permutation(0, 7).is_empty());
+    assert_eq!(deterministic_permutation(1, 7), [0]);
+
+    let mut rejection = SplitMix64::new(0);
+    assert_eq!(rejection.next_u64(), 0xe220_a839_7b1d_cdaf);
+    assert_eq!(
+        rejection.uniform_below((1_u64 << 63) + 1),
+        0x788b_b8a8_724c_81eb
+    );
+    assert_eq!(
+        rejection.next_u64(),
+        0x1b39_896a_51a8_749b,
+        "bounded sampling must have rejected the two preceding candidates"
+    );
+}
+
+#[test]
+fn workload_names_and_trace_random_access_cover_every_boundary() {
+    let expected_names = [
+        "random_get",
+        "range_scan",
+        "single_put",
+        "batch_put",
+        "single_delete",
+        "batch_delete",
+    ];
+    for (workload, expected) in Workload::ALL.into_iter().zip(expected_names) {
+        assert_eq!(workload.as_str(), expected);
+        assert_eq!(workload.to_string(), expected);
+    }
+
+    let config = BenchConfig::test_only(10, 3, 2, 8, 6);
+    let trace = Trace::generate(&config, Workload::BatchPut, 0).unwrap();
+    assert_eq!(trace.request(0), Some(&trace.logical_ids()[0..2]));
+    assert_eq!(
+        trace.request(trace.request_count() - 1),
+        Some(&trace.logical_ids()[8..10])
+    );
+    assert_eq!(trace.request(trace.request_count()), None);
+    assert_eq!(trace.request(usize::MAX), None);
+    assert_eq!(trace.request(usize::MAX / 2), None);
 }
 
 #[test]
@@ -83,6 +129,10 @@ fn all_six_small_traces_have_frozen_golden_content() {
         let trace = Trace::generate(&config, workload, 0).expect("small trace must generate");
         assert_eq!(trace.workload(), workload);
         assert_eq!(trace.repetition(), 0);
+        assert_eq!(
+            trace.records_per_operation(),
+            workload.records_per_operation(&config)
+        );
         assert_eq!(trace.request_width(), request_width);
         assert_eq!(trace.logical_ids(), logical_ids);
         assert_eq!(

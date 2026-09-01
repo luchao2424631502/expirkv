@@ -3,8 +3,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use kv_bench::{
-    BackendKind, BackendOperation, BackendResult, BatchItem, BenchBackend, BenchConfig,
-    ExpectedRecord, LevelDbBackend, RustKvBackend, ScanRequest, encode_key, fixed_value,
+    BackendError, BackendKind, BackendOperation, BackendResult, BatchItem, BenchBackend,
+    BenchConfig, ExpectedRecord, LevelDbBackend, RustKvBackend, ScanRequest, encode_key,
+    fixed_value,
 };
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
@@ -101,6 +102,8 @@ fn both_backends_preserve_mixed_batch_order_and_handle_100_item_batches() -> Tes
         let temporary = TestDirectory::new(choice.label());
         let mixed_path = temporary.path().join("mixed-db");
         let mixed = open_backend(choice, &mixed_path, &config)?;
+        mixed.write_batch(&[])?;
+        assert_terminal_state(mixed.as_ref(), &[])?;
         mixed.write_batch(&[
             BatchItem::Put {
                 key: b"b",
@@ -240,19 +243,41 @@ fn both_backends_match_iterator_seek_limits_and_validation_modes() -> TestResult
         let wrong_bytes = backend
             .iterator_scan(ScanRequest::full(&sparse_keys[0], 1, &wrong_record))
             .unwrap_err();
-        assert_eq!(wrong_bytes.operation(), BackendOperation::IteratorScan);
+        assert_scan_error(&wrong_bytes, choice, "value differs from expected bytes");
+
+        let wrong_key_record = [ExpectedRecord {
+            key: &sparse_keys[1],
+            value: &value,
+        }];
+        let wrong_key = backend
+            .iterator_scan(ScanRequest::full(&sparse_keys[0], 1, &wrong_key_record))
+            .unwrap_err();
+        assert_scan_error(&wrong_key, choice, "key differs from expected bytes");
+
+        let unexpected_extra = backend
+            .iterator_scan(ScanRequest::full(&sparse_keys[0], 1, &[]))
+            .unwrap_err();
+        assert_scan_error(&unexpected_extra, choice, "unexpected extra record");
+
+        let two_expected = [
+            ExpectedRecord {
+                key: &sparse_keys[0],
+                value: &value,
+            },
+            ExpectedRecord {
+                key: &sparse_keys[1],
+                value: &value,
+            },
+        ];
+        let too_few = backend
+            .iterator_scan(ScanRequest::full(&sparse_keys[0], 1, &two_expected))
+            .unwrap_err();
+        assert_scan_error(&too_few, choice, "expected");
 
         let wrong_length = backend
             .iterator_scan(ScanRequest::timed(b"", 1, value.len() - 1))
             .unwrap_err();
-        assert_eq!(wrong_length.operation(), BackendOperation::IteratorScan);
-        assert_eq!(
-            wrong_length.backend(),
-            match choice {
-                BackendChoice::RustKv => BackendKind::RustKv,
-                BackendChoice::LevelDb => BackendKind::LevelDb,
-            }
-        );
+        assert_scan_error(&wrong_length, choice, "value length");
 
         let consecutive_keys: Vec<_> = (100..200)
             .map(|id| encode_key(&config, id).unwrap())
@@ -275,6 +300,38 @@ fn both_backends_match_iterator_seek_limits_and_validation_modes() -> TestResult
         );
     }
     Ok(())
+}
+
+fn assert_scan_error(error: &BackendError, choice: BackendChoice, expected_text: &str) {
+    assert_eq!(error.operation(), BackendOperation::IteratorScan);
+    assert_eq!(
+        error.backend(),
+        match choice {
+            BackendChoice::RustKv => BackendKind::RustKv,
+            BackendChoice::LevelDb => BackendKind::LevelDb,
+        }
+    );
+    assert!(
+        error.source_text().contains(expected_text),
+        "unexpected scan error text: {}",
+        error.source_text()
+    );
+}
+
+#[test]
+fn backend_and_operation_labels_are_complete_and_stable() {
+    assert_eq!(BackendKind::RustKv.as_str(), "rustkv");
+    assert_eq!(BackendKind::LevelDb.as_str(), "leveldb");
+    for (operation, label) in [
+        (BackendOperation::Open, "open"),
+        (BackendOperation::Get, "get"),
+        (BackendOperation::Put, "put"),
+        (BackendOperation::Delete, "delete"),
+        (BackendOperation::WriteBatch, "write_batch"),
+        (BackendOperation::IteratorScan, "iterator_scan"),
+    ] {
+        assert_eq!(operation.as_str(), label);
+    }
 }
 
 fn assert_terminal_state(backend: &dyn BenchBackend, records: &[(&[u8], &[u8])]) -> TestResult {

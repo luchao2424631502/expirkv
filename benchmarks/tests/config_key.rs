@@ -50,6 +50,20 @@ fn small_configuration_is_unambiguously_non_formal() {
 }
 
 #[test]
+fn invalid_small_configurations_are_rejected_before_trace_generation() {
+    let invalid: [fn() -> BenchConfig; 5] = [
+        || BenchConfig::test_only(0, 0, 1, 1, 1),
+        || BenchConfig::test_only(10, 0, 1, 1, 1),
+        || BenchConfig::test_only(10, 11, 1, 1, 1),
+        || BenchConfig::test_only(10, 1, 0, 1, 1),
+        || BenchConfig::test_only(10, 1, 3, 1, 1),
+    ];
+    for invalid in invalid {
+        assert!(std::panic::catch_unwind(invalid).is_err());
+    }
+}
+
+#[test]
 fn key_codec_is_exact_big_endian_and_order_preserving() {
     let config = BenchConfig::formal();
     let cases = [0, 1, 255, 256, config.record_count() - 1];

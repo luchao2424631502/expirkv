@@ -105,6 +105,7 @@ pub struct Trace {
     workload: Workload,
     repetition: u32,
     seed: u64,
+    records_per_operation: u64,
     request_width: usize,
     logical_ids: Vec<u64>,
 }
@@ -122,6 +123,7 @@ impl Trace {
             });
         }
         let seed = derive_trace_seed(config.seed(), workload, repetition);
+        let records_per_operation = workload.records_per_operation(config);
         let request_width = to_usize(workload.request_width(config))?;
         let operation_count = to_usize(workload.operation_count(config))?;
 
@@ -155,6 +157,7 @@ impl Trace {
             workload,
             repetition,
             seed,
+            records_per_operation,
             request_width,
             logical_ids,
         })
@@ -170,6 +173,13 @@ impl Trace {
 
     pub const fn seed(&self) -> u64 {
         self.seed
+    }
+
+    /// Number of logical records represented by one request in this Trace.
+    /// This is captured from the generating configuration so later stages
+    /// cannot silently report a caller-supplied, mismatched records/op value.
+    pub const fn records_per_operation(&self) -> u64 {
+        self.records_per_operation
     }
 
     pub const fn request_width(&self) -> usize {

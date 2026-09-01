@@ -6,7 +6,9 @@
 mod backend;
 mod config;
 mod key;
+mod metrics;
 mod rng;
+mod runner;
 mod trace;
 
 pub use backend::{
@@ -16,7 +18,9 @@ pub use backend::{
 };
 pub use config::{BenchConfig, BenchMode};
 pub use key::{KEY_LENGTH, KeyCodecError, decode_key, encode_key, fixed_value};
+pub use metrics::{LatencySummary, MetricsError, RunMetrics, calculate_run_metrics};
 pub use rng::{SplitMix64, deterministic_permutation, mix64};
+pub use runner::{RequestContext, RunError, RunResult, RunSpec, ThreadRunSummary, run_concurrent};
 pub use trace::{Trace, TraceError, TracePartition, Workload, derive_trace_seed};
 
 /// The pinned LevelDB version used by every benchmark build.

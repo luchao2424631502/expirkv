@@ -50,6 +50,22 @@ fn leveldb_invalid_layout_error_preserves_backend_operation_and_text() -> TestRe
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn leveldb_rejects_an_interior_nul_path_before_entering_the_c_api() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let path = PathBuf::from(OsString::from_vec(b"invalid\0leveldb-path".to_vec()));
+    let error = match LevelDbBackend::open(&path, &test_config()) {
+        Ok(_) => panic!("LevelDB unexpectedly accepted an interior-NUL path"),
+        Err(error) => error,
+    };
+    assert_eq!(error.backend(), BackendKind::LevelDb);
+    assert_eq!(error.operation(), BackendOperation::Open);
+    assert!(error.source_text().contains("interior NUL"));
+}
+
 #[test]
 fn linked_binary_exposes_exactly_two_benchmark_aggregate_symbols() -> TestResult {
     let temporary = TestDirectory::new("symbols");
