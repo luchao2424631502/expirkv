@@ -102,6 +102,7 @@ pub const fn derive_trace_seed(base_seed: u64, workload: Workload, repetition: u
 /// request boundaries without allocating a request object per operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Trace {
+    generating_config: BenchConfig,
     workload: Workload,
     repetition: u32,
     seed: u64,
@@ -154,6 +155,7 @@ impl Trace {
 
         debug_assert_eq!(logical_ids.len(), operation_count * request_width);
         Ok(Self {
+            generating_config: config.clone(),
             workload,
             repetition,
             seed,
@@ -165,6 +167,12 @@ impl Trace {
 
     pub const fn workload(&self) -> Workload {
         self.workload
+    }
+
+    /// The generating configuration is retained privately so a later
+    /// WorkloadRun cannot relabel a smoke or smaller-domain Trace as formal.
+    pub(crate) fn was_generated_from(&self, config: &BenchConfig) -> bool {
+        &self.generating_config == config
     }
 
     pub const fn repetition(&self) -> u32 {

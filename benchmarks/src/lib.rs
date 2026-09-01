@@ -10,6 +10,7 @@ mod metrics;
 mod rng;
 mod runner;
 mod trace;
+mod workload;
 
 pub use backend::{
     BackendError, BackendKind, BackendOperation, BackendResult, BatchItem, BenchBackend,
@@ -22,6 +23,7 @@ pub use metrics::{LatencySummary, MetricsError, RunMetrics, calculate_run_metric
 pub use rng::{SplitMix64, deterministic_permutation, mix64};
 pub use runner::{RequestContext, RunError, RunResult, RunSpec, ThreadRunSummary, run_concurrent};
 pub use trace::{Trace, TraceError, TracePartition, Workload, derive_trace_seed};
+pub use workload::{WorkloadError, WorkloadRun, run_workload};
 
 /// The pinned LevelDB version used by every benchmark build.
 pub const EXPECTED_LEVELDB_VERSION: (i32, i32) = (1, 23);

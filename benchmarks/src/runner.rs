@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use crate::{
     BackendError, BackendKind, BatchItem, BenchBackend, GetResult, MetricsError, RunMetrics,
-    ScanRequest, ScanResult, Trace, TracePartition, Workload, calculate_run_metrics,
+    ScanRequest, ScanResult, Trace, TracePartition, Workload, WorkloadError, calculate_run_metrics,
 };
 
 const FORMAL_THREAD_COUNTS: [usize; 4] = [1, 10, 100, 1_000];
@@ -29,6 +29,7 @@ pub struct RunSpec<'a> {
 pub enum RunError {
     InvalidSpec(String),
     Backend(BackendError),
+    Workload(WorkloadError),
     WorkerPanic {
         thread_index: usize,
         message: String,
@@ -289,7 +290,10 @@ impl<'a> RequestContext<'a> {
 
     fn finish(self, execution: Result<(), RunError>) -> Result<u64, RunError> {
         if self.calls == 0 {
-            return Err(RunError::MissingBackendCall);
+            return match execution {
+                Ok(()) => Err(RunError::MissingBackendCall),
+                Err(error) => Err(error),
+            };
         }
         if self.calls != 1 {
             return Err(RunError::MultipleBackendCalls { calls: self.calls });
@@ -396,7 +400,7 @@ fn finish_run(spec: &RunSpec<'_>, wall_time: Duration, outcomes: Vec<WorkerOutco
     result
 }
 
-fn invalid_before_start(spec: &RunSpec<'_>, error: RunError) -> RunResult {
+pub(crate) fn invalid_before_start(spec: &RunSpec<'_>, error: RunError) -> RunResult {
     RunResult {
         backend_kind: spec.backend_kind,
         workload: spec.workload,
@@ -560,6 +564,40 @@ mod tests {
         assert_eq!(result.completed_ops, 0);
         assert_eq!(result.error_count, 1);
         assert!(matches!(result.first_error, Some(RunError::Backend(_))));
+        assert!(result.metrics.is_none());
+    }
+
+    #[test]
+    fn pre_backend_workload_error_is_preserved_as_the_first_error() {
+        let config = BenchConfig::test_only(2, 1, 1, 2, 1);
+        let trace = Trace::generate(&config, Workload::RandomGet, 0).unwrap();
+        let fake = Arc::new(FailingBackend {
+            calls: AtomicUsize::new(0),
+            fail_at: usize::MAX,
+        });
+        let backend: Arc<dyn BenchBackend> = fake.clone();
+        let result = run_concurrent(
+            RunSpec {
+                backend_kind: BackendKind::RustKv,
+                backend,
+                workload: Workload::RandomGet,
+                thread_count: 1,
+                repetition: 0,
+                trace: &trace,
+                expected_ops: 2,
+                records_per_op: 1,
+            },
+            |_request, _| Err(RunError::Workload(WorkloadError::GetNotFound { id: 17 })),
+        );
+
+        assert!(!result.is_valid());
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(result.completed_ops, 0);
+        assert_eq!(result.error_count, 1);
+        assert_eq!(
+            result.first_error,
+            Some(RunError::Workload(WorkloadError::GetNotFound { id: 17 }))
+        );
         assert!(result.metrics.is_none());
     }
 
