@@ -4,8 +4,16 @@
 //! workloads, traces, and statistics belong to later reviewed stages.
 
 mod backend;
+mod config;
+mod key;
+mod rng;
+mod trace;
 
 pub use backend::linked_leveldb_version;
+pub use config::{BenchConfig, BenchMode};
+pub use key::{KEY_LENGTH, KeyCodecError, decode_key, encode_key, fixed_value};
+pub use rng::{SplitMix64, deterministic_permutation, mix64};
+pub use trace::{Trace, TraceError, TracePartition, Workload, derive_trace_seed};
 
 /// The pinned LevelDB version used by every benchmark build.
 pub const EXPECTED_LEVELDB_VERSION: (i32, i32) = (1, 23);
