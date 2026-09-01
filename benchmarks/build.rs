@@ -1,6 +1,7 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 const LEVELDB_MAJOR: u32 = 1;
 const LEVELDB_MINOR: u32 = 23;
@@ -32,11 +33,30 @@ fn main() {
     validate_header_version(&db_header);
     validate_provenance(&provenance);
 
+    let native_header = crate_dir.join("native/leveldb_aggregate.h");
+    let native_source = crate_dir.join("native/leveldb_aggregate.c");
+    require_file(&native_header, "benchmark LevelDB aggregate header");
+    require_file(&native_source, "benchmark LevelDB aggregate source");
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR must be set by Cargo"));
+    let aggregate_library = compile_aggregate(&prefix, &native_source, &out_dir);
+
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed={}", native_header.display());
+    println!("cargo:rerun-if-changed={}", native_source.display());
     println!("cargo:rerun-if-changed={}", c_header.display());
     println!("cargo:rerun-if-changed={}", db_header.display());
     println!("cargo:rerun-if-changed={}", library.display());
     println!("cargo:rerun-if-changed={}", provenance.display());
+    println!("cargo:rerun-if-env-changed=CC");
+    println!("cargo:rerun-if-env-changed=AR");
+    println!(
+        "cargo:rustc-link-search=native={}",
+        aggregate_library
+            .parent()
+            .expect("aggregate library must have a parent")
+            .display()
+    );
+    println!("cargo:rustc-link-lib=static=kv_bench_leveldb_aggregate");
     println!(
         "cargo:rustc-link-search=native={}",
         prefix.join("lib").display()
@@ -49,6 +69,44 @@ fn main() {
         Ok(target) => panic!("kv_bench does not define LevelDB C++ linkage for target OS {target}"),
         Err(error) => panic!("CARGO_CFG_TARGET_OS is unavailable: {error}"),
     }
+}
+
+fn compile_aggregate(prefix: &Path, source: &Path, out_dir: &Path) -> PathBuf {
+    let object = out_dir.join("leveldb_aggregate.o");
+    let library = out_dir.join("libkv_bench_leveldb_aggregate.a");
+    let compiler = env::var_os("CC").unwrap_or_else(|| "cc".into());
+    let archiver = env::var_os("AR").unwrap_or_else(|| "ar".into());
+
+    let mut compile = Command::new(compiler);
+    compile
+        .arg("-std=c11")
+        .arg("-O3")
+        .arg("-DNDEBUG")
+        .arg("-I")
+        .arg(prefix.join("include"))
+        .arg("-I")
+        .arg(
+            source
+                .parent()
+                .expect("aggregate source must have a parent"),
+        )
+        .arg("-c")
+        .arg(source)
+        .arg("-o")
+        .arg(&object);
+    run(&mut compile, "compile benchmark LevelDB aggregate");
+
+    let mut archive = Command::new(archiver);
+    archive.arg("crus").arg(&library).arg(&object);
+    run(&mut archive, "archive benchmark LevelDB aggregate");
+    library
+}
+
+fn run(command: &mut Command, description: &str) {
+    let status = command
+        .status()
+        .unwrap_or_else(|error| panic!("failed to {description}: {error}"));
+    assert!(status.success(), "failed to {description}: {status}");
 }
 
 fn require_file(path: &Path, description: &str) {

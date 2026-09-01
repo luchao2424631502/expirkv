@@ -9,7 +9,11 @@ mod key;
 mod rng;
 mod trace;
 
-pub use backend::linked_leveldb_version;
+pub use backend::{
+    BackendError, BackendKind, BackendOperation, BackendResult, BatchItem, BenchBackend,
+    ExpectedRecord, GetResult, LevelDbBackend, RustKvBackend, ScanRequest, ScanResult,
+    ScanValidation, linked_leveldb_version,
+};
 pub use config::{BenchConfig, BenchMode};
 pub use key::{KEY_LENGTH, KeyCodecError, decode_key, encode_key, fixed_value};
 pub use rng::{SplitMix64, deterministic_permutation, mix64};
