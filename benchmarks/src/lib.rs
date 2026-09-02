@@ -5,11 +5,14 @@
 
 mod backend;
 mod config;
+mod fs;
 mod key;
 mod metrics;
 mod rng;
 mod runner;
+mod template;
 mod trace;
+mod validation;
 mod workload;
 
 pub use backend::{
@@ -18,11 +21,21 @@ pub use backend::{
     ScanValidation, linked_leveldb_version,
 };
 pub use config::{BenchConfig, BenchMode};
+pub use fs::{BenchmarkWorkspace, DatabaseDirectory, FsError, FsErrorKind};
 pub use key::{KEY_LENGTH, KeyCodecError, decode_key, encode_key, fixed_value};
 pub use metrics::{LatencySummary, MetricsError, RunMetrics, calculate_run_metrics};
 pub use rng::{SplitMix64, deterministic_permutation, mix64};
 pub use runner::{RequestContext, RunError, RunResult, RunSpec, ThreadRunSummary, run_concurrent};
+pub use template::{
+    DatabaseTemplate, OpenRun, PreparedRun, TemplateBuildFault, TemplateError, TemplateErrorKind,
+    TemplateOpenGuard, build_formal_template, build_test_template, build_test_template_with_fault,
+    prepare_run,
+};
 pub use trace::{Trace, TraceError, TracePartition, Workload, derive_trace_seed};
+pub use validation::{
+    ValidationError, ValidationSummary, prewarm_full_dataset, validate_empty_dataset,
+    validate_final_dataset, validate_full_dataset,
+};
 pub use workload::{WorkloadError, WorkloadRun, run_workload};
 
 /// The pinned LevelDB version used by every benchmark build.
