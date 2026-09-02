@@ -33,8 +33,8 @@ use crate::index::TestCommitFailure;
 use crate::index::{
     DATABASE_IDENTITY_KEY, DURABLE_FRONTIER_KEY, DatabaseIdentityV0, FjallBackend, HEAD_SEQ_KEY,
     IndexApplyState, IndexAtomicBatch, IndexBackend, IndexCommitError, IndexCommitMode, IndexEntry,
-    IndexMutation, InternalIndexError, InternalIndexSpace, InternalKeyRange, initialization_batch,
-    is_encoded_empty_durable_frontier, is_encoded_head_seq_zero,
+    IndexMutation, InternalIndexError, InternalIndexSpace, InternalKeyRange, UserKeyRange,
+    initialization_batch, is_encoded_empty_durable_frontier, is_encoded_head_seq_zero,
 };
 use crate::lock::{
     ManagedEntryKind, RootLock, invalid_argument_error, layout_error, not_found_error,
@@ -640,6 +640,14 @@ pub(crate) trait UserIndexSnapshot: Send + Sync {
     fn get_user_pointer(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
 
     fn iter_user(&self) -> Result<UserIndexIterator>;
+
+    fn iter_user_range(&self, range: UserKeyRange) -> Result<UserIndexIterator> {
+        let iterator = self.iter_user()?;
+        Ok(Box::new(iterator.filter(move |entry| match entry {
+            Ok(entry) => range.contains(&entry.key),
+            Err(_) => true,
+        })))
+    }
 }
 
 struct BackendIndexSnapshot<T: IndexBackend> {
@@ -656,6 +664,10 @@ impl<T: IndexBackend + 'static> UserIndexSnapshot for BackendIndexSnapshot<T> {
         self.backend
             .iter_user(Some(&self.snapshot))
             .map(|iterator| Box::new(iterator) as UserIndexIterator)
+    }
+
+    fn iter_user_range(&self, range: UserKeyRange) -> Result<UserIndexIterator> {
+        self.backend.iter_user_range(Some(&self.snapshot), range)
     }
 }
 
@@ -1719,11 +1731,15 @@ impl Db {
             .end
             .map(|bound| clone_range_bound(bound, started.instance_state))
             .transpose()?;
+        let start = range
+            .start
+            .map(|bound| clone_range_bound(bound, started.instance_state))
+            .transpose()?;
         let view = self
             .inner
             .select_read_view(options, Operation::Range, started)?;
         let iterator = view
-            .iter_user()
+            .iter_user_range(UserKeyRange::forward(start, end.clone()))
             .map_err(|error| self.inner.map_index_read_failure(error, Operation::Range))?;
         self.inner.complete_read(started, Operation::Range)?;
         #[cfg(not(test))]
@@ -1737,10 +1753,7 @@ impl Db {
         #[cfg(test)]
         let mut inner =
             DbIterator::new_for_test(Arc::clone(&self.inner), view, iterator, Operation::Range);
-        match range.start {
-            Some(start) => inner.seek_before(start, end.as_deref()),
-            None => inner.seek_to_first_before(end.as_deref()),
-        }
+        inner.seek_to_first_in_initial_range();
         #[cfg(not(test))]
         let cursor = RangeCursor::new(inner, end, limit);
         #[cfg(test)]

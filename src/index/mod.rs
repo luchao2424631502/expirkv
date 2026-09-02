@@ -1,6 +1,8 @@
 //! Private index-backend capability boundary.
 #![allow(dead_code)] // Stage 4 boundary; the Fjall adapter is connected in stage 5.
 
+use std::ops::Bound;
+
 use crc32c::crc32c;
 
 use crate::{Operation, ProtocolStage, Result, RetryAdvice, StorageError, StorageErrorKind};
@@ -518,6 +520,72 @@ pub(crate) struct IndexEntry {
     pub(crate) value: Vec<u8>,
 }
 
+/// Owned bounds for an ordered user-index scan. The type is deliberately
+/// backend-independent so range positioning does not expose Fjall through the
+/// read path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct UserKeyRange {
+    start: Bound<Vec<u8>>,
+    end: Bound<Vec<u8>>,
+}
+
+impl UserKeyRange {
+    pub(crate) fn all() -> Self {
+        Self {
+            start: Bound::Unbounded,
+            end: Bound::Unbounded,
+        }
+    }
+
+    pub(crate) fn from_inclusive(start: Vec<u8>) -> Self {
+        Self {
+            start: Bound::Included(start),
+            end: Bound::Unbounded,
+        }
+    }
+
+    pub(crate) fn after(start: Vec<u8>) -> Self {
+        Self {
+            start: Bound::Excluded(start),
+            end: Bound::Unbounded,
+        }
+    }
+
+    pub(crate) fn before(end: Vec<u8>) -> Self {
+        Self {
+            start: Bound::Unbounded,
+            end: Bound::Excluded(end),
+        }
+    }
+
+    pub(crate) fn forward(start: Option<Vec<u8>>, end: Option<Vec<u8>>) -> Self {
+        Self {
+            start: start.map_or(Bound::Unbounded, Bound::Included),
+            end: end.map_or(Bound::Unbounded, Bound::Excluded),
+        }
+    }
+
+    pub(crate) fn contains(&self, key: &[u8]) -> bool {
+        let after_start = match &self.start {
+            Bound::Included(start) => key >= start.as_slice(),
+            Bound::Excluded(start) => key > start.as_slice(),
+            Bound::Unbounded => true,
+        };
+        let before_end = match &self.end {
+            Bound::Included(end) => key <= end.as_slice(),
+            Bound::Excluded(end) => key < end.as_slice(),
+            Bound::Unbounded => true,
+        };
+        after_start && before_end
+    }
+
+    pub(crate) fn into_bounds(self) -> (Bound<Vec<u8>>, Bound<Vec<u8>>) {
+        (self.start, self.end)
+    }
+}
+
+pub(crate) type UserRangeIterator = Box<dyn DoubleEndedIterator<Item = Result<IndexEntry>> + Send>;
+
 impl IndexEntry {
     pub(crate) fn new(key: Vec<u8>, value: Vec<u8>) -> Self {
         Self { key, value }
@@ -567,7 +635,7 @@ impl Default for InternalKeyRange {
 /// type can escape through this interface.
 pub(crate) trait IndexBackend: Send + Sync {
     type Snapshot: Clone + Send + Sync;
-    type UserIterator: DoubleEndedIterator<Item = Result<IndexEntry>> + Send;
+    type UserIterator: DoubleEndedIterator<Item = Result<IndexEntry>> + Send + 'static;
     type InternalIterator: Iterator<Item = Result<IndexEntry>> + Send;
 
     fn commit_atomic(
@@ -591,6 +659,21 @@ pub(crate) trait IndexBackend: Send + Sync {
     fn snapshot(&self) -> Result<Self::Snapshot>;
 
     fn iter_user(&self, snapshot: Option<&Self::Snapshot>) -> Result<Self::UserIterator>;
+
+    /// Creates a cursor already positioned to the requested ordered bounds.
+    /// Backends used only by isolated tests may rely on this correctness
+    /// fallback; production adapters override it with native range seeking.
+    fn iter_user_range(
+        &self,
+        snapshot: Option<&Self::Snapshot>,
+        range: UserKeyRange,
+    ) -> Result<UserRangeIterator> {
+        let iterator = self.iter_user(snapshot)?;
+        Ok(Box::new(iterator.filter(move |entry| match entry {
+            Ok(entry) => range.contains(&entry.key),
+            Err(_) => true,
+        })))
+    }
 }
 
 mod fjall;
@@ -685,6 +768,15 @@ impl IndexBackend for LateBoundFjallBackend {
     fn iter_user(&self, snapshot: Option<&Self::Snapshot>) -> Result<Self::UserIterator> {
         self.backend(Operation::Iterator, ProtocolStage::Read)?
             .iter_user(snapshot)
+    }
+
+    fn iter_user_range(
+        &self,
+        snapshot: Option<&Self::Snapshot>,
+        range: UserKeyRange,
+    ) -> Result<UserRangeIterator> {
+        self.backend(Operation::Iterator, ProtocolStage::Read)?
+            .iter_user_range(snapshot, range)
     }
 }
 

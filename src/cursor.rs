@@ -5,7 +5,7 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use crate::db::{DbInner, UserIndexIterator, UserIndexSnapshot};
-use crate::index::IndexEntry;
+use crate::index::{IndexEntry, UserKeyRange};
 #[cfg(not(test))]
 use crate::runtime::ExternalLease;
 use crate::{InstanceState, Operation, RetryAdvice, StorageError, StorageErrorKind};
@@ -25,10 +25,11 @@ pub struct DbIterator {
     // the backend iterator/view, and keep DbInner/root-lock resources last.
     #[cfg(not(test))]
     _lease: ExternalLease,
-    initial_iterator: Option<UserIndexIterator>,
+    iterator: Option<UserIndexIterator>,
     view: Option<Arc<dyn UserIndexSnapshot>>,
     operation: Operation,
     state: CursorState,
+    direction: Option<CursorDirection>,
     current_key: Option<Vec<u8>>,
     current_value: Option<Vec<u8>>,
     error: Option<StorageError>,
@@ -40,8 +41,12 @@ enum CursorTarget<'a> {
     First,
     Last,
     LowerBound(&'a [u8]),
-    GreaterThan(&'a [u8]),
-    LessThan(&'a [u8]),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CursorDirection {
+    Forward,
+    Reverse,
 }
 
 impl DbIterator {
@@ -55,10 +60,11 @@ impl DbIterator {
     ) -> Self {
         Self {
             _lease: lease,
-            initial_iterator: Some(initial_iterator),
+            iterator: Some(initial_iterator),
             view: Some(view),
             operation,
             state: CursorState::Unpositioned,
+            direction: None,
             current_key: None,
             current_value: None,
             error: None,
@@ -71,10 +77,11 @@ impl DbIterator {
     pub(crate) fn empty(db: Arc<DbInner>, operation: Operation, lease: ExternalLease) -> Self {
         Self {
             _lease: lease,
-            initial_iterator: None,
+            iterator: None,
             view: None,
             operation,
             state: CursorState::Exhausted,
+            direction: None,
             current_key: None,
             current_value: None,
             error: None,
@@ -92,10 +99,11 @@ impl DbIterator {
         operation: Operation,
     ) -> Self {
         Self {
-            initial_iterator: Some(initial_iterator),
+            iterator: Some(initial_iterator),
             view: Some(view),
             operation,
             state: CursorState::Unpositioned,
+            direction: None,
             current_key: None,
             current_value: None,
             error: None,
@@ -107,10 +115,11 @@ impl DbIterator {
     #[cfg(test)]
     pub(crate) fn empty_for_test(db: Arc<DbInner>, operation: Operation) -> Self {
         Self {
-            initial_iterator: None,
+            iterator: None,
             view: None,
             operation,
             state: CursorState::Exhausted,
+            direction: None,
             current_key: None,
             current_value: None,
             error: None,
@@ -127,19 +136,19 @@ impl DbIterator {
 
     pub fn seek_to_first(&mut self) {
         if self.state != CursorState::Failed {
-            self.relocate(CursorTarget::First, None);
+            self.relocate(CursorTarget::First);
         }
     }
 
     pub fn seek_to_last(&mut self) {
         if self.state != CursorState::Failed {
-            self.relocate(CursorTarget::Last, None);
+            self.relocate(CursorTarget::Last);
         }
     }
 
     pub fn seek(&mut self, target: &[u8]) {
         if self.state != CursorState::Failed {
-            self.relocate(CursorTarget::LowerBound(target), None);
+            self.relocate(CursorTarget::LowerBound(target));
         }
     }
 
@@ -147,24 +156,14 @@ impl DbIterator {
         if self.state != CursorState::Valid {
             return;
         }
-        let Some(current) = self.current_key.take() else {
-            self.set_failure(cursor_invariant_error(self.operation));
-            return;
-        };
-        self.current_value = None;
-        self.relocate(CursorTarget::GreaterThan(&current), None);
+        self.advance(CursorDirection::Forward);
     }
 
     pub fn prev(&mut self) {
         if self.state != CursorState::Valid {
             return;
         }
-        let Some(current) = self.current_key.take() else {
-            self.set_failure(cursor_invariant_error(self.operation));
-            return;
-        };
-        self.current_value = None;
-        self.relocate(CursorTarget::LessThan(&current), None);
+        self.advance(CursorDirection::Reverse);
     }
 
     pub fn key(&self) -> Option<&[u8]> {
@@ -184,7 +183,7 @@ impl DbIterator {
         }
     }
 
-    fn relocate(&mut self, target: CursorTarget<'_>, exclusive_end: Option<&[u8]>) {
+    fn relocate(&mut self, target: CursorTarget<'_>) {
         #[cfg(not(test))]
         let _operation = match self.db.begin_operation(self.operation) {
             Ok(operation) => operation,
@@ -212,19 +211,114 @@ impl DbIterator {
             return;
         }
 
-        let mut iterator = match self.take_iterator() {
-            Ok(Some(iterator)) => iterator,
-            Ok(None) => {
-                self.exhaust();
-                return;
+        let (range, direction, may_use_initial) = match target {
+            CursorTarget::First => (UserKeyRange::all(), CursorDirection::Forward, true),
+            CursorTarget::Last => (UserKeyRange::all(), CursorDirection::Reverse, true),
+            CursorTarget::LowerBound(target) => {
+                let start = match clone_cursor_bound(target, self.operation, started.instance_state)
+                {
+                    Ok(start) => start,
+                    Err(error) => {
+                        self.set_failure(error);
+                        return;
+                    }
+                };
+                (
+                    UserKeyRange::from_inclusive(start),
+                    CursorDirection::Forward,
+                    false,
+                )
             }
+        };
+
+        let initial =
+            may_use_initial && self.state == CursorState::Unpositioned && self.direction.is_none();
+        let iterator = if initial { self.iterator.take() } else { None };
+        let iterator = match iterator {
+            Some(iterator) => Some(iterator),
+            None => match self.create_iterator(range) {
+                Ok(iterator) => iterator,
+                Err(error) => {
+                    self.set_failure(error);
+                    return;
+                }
+            },
+        };
+        let Some(iterator) = iterator else {
+            self.exhaust();
+            return;
+        };
+        self.iterator = Some(iterator);
+        self.direction = Some(direction);
+        self.current_key = None;
+        self.current_value = None;
+        self.consume_adjacent(started, direction);
+    }
+
+    fn advance(&mut self, direction: CursorDirection) {
+        #[cfg(not(test))]
+        let _operation = match self.db.begin_operation(self.operation) {
+            Ok(operation) => operation,
             Err(error) => {
-                let error = self.db.map_index_read_failure(error, self.operation);
                 self.set_failure(error);
                 return;
             }
         };
-        let selected = match select_entry(&mut iterator, target) {
+
+        let started = match self.db.begin_read(self.operation) {
+            Ok(started) => started,
+            Err(error) => {
+                self.set_failure(error);
+                return;
+            }
+        };
+        let Some(current) = self.current_key.take() else {
+            self.set_failure(cursor_invariant_error(self.operation));
+            return;
+        };
+        self.current_value = None;
+
+        if self.direction != Some(direction) {
+            let range = match direction {
+                CursorDirection::Forward => UserKeyRange::after(current),
+                CursorDirection::Reverse => UserKeyRange::before(current),
+            };
+            let iterator = match self.create_iterator(range) {
+                Ok(Some(iterator)) => iterator,
+                Ok(None) => {
+                    self.exhaust();
+                    return;
+                }
+                Err(error) => {
+                    self.set_failure(error);
+                    return;
+                }
+            };
+            self.iterator = Some(iterator);
+            self.direction = Some(direction);
+        }
+
+        self.consume_adjacent(started, direction);
+    }
+
+    fn create_iterator(&self, range: UserKeyRange) -> crate::Result<Option<UserIndexIterator>> {
+        self.view
+            .as_ref()
+            .map(|view| view.iter_user_range(range))
+            .transpose()
+            .map_err(|error| self.db.map_index_read_failure(error, self.operation))
+    }
+
+    fn consume_adjacent(
+        &mut self,
+        started: crate::db::ReadStateSnapshot,
+        direction: CursorDirection,
+    ) {
+        let selected = match self.iterator.as_mut() {
+            Some(iterator) => select_entry(iterator, direction),
+            None => Err(cursor_invariant_error(self.operation)),
+        };
+        let selected = match selected {
             Ok(selected) => selected,
             Err(error) => {
                 let error = self.db.map_index_read_failure(error, self.operation);
@@ -240,17 +334,6 @@ impl DbIterator {
             return;
         };
 
-        // A Range end is exclusive. Decide membership from the owned index
-        // key before touching the ValuePointer or Value Log so an out-of-range
-        // damaged record cannot fail or poison an otherwise complete range.
-        if exclusive_end.is_some_and(|end| entry.key.as_slice() >= end) {
-            match self.db.complete_read(started, self.operation) {
-                Ok(()) => self.exhaust(),
-                Err(error) => self.set_failure(error),
-            }
-            return;
-        }
-
         match self
             .db
             .materialize_index_entry(started, self.operation, entry)
@@ -265,35 +348,17 @@ impl DbIterator {
         }
     }
 
-    fn take_iterator(&mut self) -> crate::Result<Option<UserIndexIterator>> {
-        if let Some(iterator) = self.initial_iterator.take() {
-            return Ok(Some(iterator));
-        }
-        self.view.as_ref().map(|view| view.iter_user()).transpose()
-    }
-
-    pub(crate) fn seek_to_first_before(&mut self, exclusive_end: Option<&[u8]>) {
+    pub(crate) fn seek_to_first_in_initial_range(&mut self) {
         if self.state != CursorState::Failed {
-            self.relocate(CursorTarget::First, exclusive_end);
+            self.relocate(CursorTarget::First);
         }
     }
 
-    pub(crate) fn seek_before(&mut self, target: &[u8], exclusive_end: Option<&[u8]>) {
-        if self.state != CursorState::Failed {
-            self.relocate(CursorTarget::LowerBound(target), exclusive_end);
-        }
-    }
-
-    fn next_before(&mut self, exclusive_end: Option<&[u8]>) {
+    fn next_in_range(&mut self) {
         if self.state != CursorState::Valid {
             return;
         }
-        let Some(current) = self.current_key.take() else {
-            self.set_failure(cursor_invariant_error(self.operation));
-            return;
-        };
-        self.current_value = None;
-        self.relocate(CursorTarget::GreaterThan(&current), exclusive_end);
+        self.advance(CursorDirection::Forward);
     }
 
     fn set_failure(&mut self, error: StorageError) {
@@ -302,6 +367,8 @@ impl DbIterator {
         }
         self.current_key = None;
         self.current_value = None;
+        self.iterator = None;
+        self.direction = None;
         self.error = Some(error);
         self.state = CursorState::Failed;
     }
@@ -312,6 +379,8 @@ impl DbIterator {
         }
         self.current_key = None;
         self.current_value = None;
+        self.iterator = None;
+        self.direction = None;
         self.error = None;
         self.state = CursorState::Exhausted;
     }
@@ -319,39 +388,30 @@ impl DbIterator {
 
 fn select_entry(
     iterator: &mut UserIndexIterator,
-    target: CursorTarget<'_>,
+    direction: CursorDirection,
 ) -> crate::Result<Option<IndexEntry>> {
-    match target {
-        CursorTarget::First => iterator.next().transpose(),
-        CursorTarget::Last => iterator.next_back().transpose(),
-        CursorTarget::LowerBound(target) => {
-            for entry in iterator {
-                let entry = entry?;
-                if entry.key.as_slice() >= target {
-                    return Ok(Some(entry));
-                }
-            }
-            Ok(None)
-        }
-        CursorTarget::GreaterThan(current) => {
-            for entry in iterator {
-                let entry = entry?;
-                if entry.key.as_slice() > current {
-                    return Ok(Some(entry));
-                }
-            }
-            Ok(None)
-        }
-        CursorTarget::LessThan(current) => {
-            while let Some(entry) = iterator.next_back() {
-                let entry = entry?;
-                if entry.key.as_slice() < current {
-                    return Ok(Some(entry));
-                }
-            }
-            Ok(None)
-        }
+    match direction {
+        CursorDirection::Forward => iterator.next().transpose(),
+        CursorDirection::Reverse => iterator.next_back().transpose(),
     }
+}
+
+fn clone_cursor_bound(
+    bound: &[u8],
+    operation: Operation,
+    state: InstanceState,
+) -> crate::Result<Vec<u8>> {
+    let mut owned = Vec::new();
+    owned.try_reserve_exact(bound.len()).map_err(|_| {
+        StorageError::read_operation_error(
+            StorageErrorKind::ResourceExhausted,
+            operation,
+            state,
+            RetryAdvice::RetrySameInstance,
+        )
+    })?;
+    owned.extend_from_slice(bound);
+    Ok(owned)
 }
 
 fn cursor_invariant_error(operation: Operation) -> StorageError {
@@ -419,7 +479,7 @@ impl RangeCursor {
             self.inner.exhaust();
             return;
         }
-        self.inner.next_before(self.end.as_deref());
+        self.inner.next_in_range();
         self.enforce_boundary();
     }
 

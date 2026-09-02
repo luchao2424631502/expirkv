@@ -20,7 +20,7 @@ use ::fjall::{
 use super::{
     DATABASE_IDENTITY_KEY, FjallIndexOptions, IndexAtomicBatch, IndexBackend, IndexCommitError,
     IndexCommitMode, IndexCompression, IndexEntry, IndexMutation, InternalIndexError,
-    InternalIndexSpace, InternalKeyRange,
+    InternalIndexSpace, InternalKeyRange, UserKeyRange, UserRangeIterator,
 };
 use crate::{
     Operation, ProtocolStage, Result, RetryAdvice, StorageError, StorageErrorKind, WriteOutcome,
@@ -856,6 +856,26 @@ impl IndexBackend for FjallBackend {
             Operation::Iterator,
             ProtocolStage::Read,
         ))
+    }
+
+    fn iter_user_range(
+        &self,
+        snapshot: Option<&Self::Snapshot>,
+        range: UserKeyRange,
+    ) -> Result<UserRangeIterator> {
+        let bounds = range.into_bounds();
+        let inner = match snapshot {
+            Some(snapshot) => {
+                self.validate_snapshot(snapshot, Operation::Iterator)?;
+                snapshot.inner.range(&self.user, bounds)
+            }
+            None => self.user.range(bounds),
+        };
+        Ok(Box::new(FjallEntryIterator::new(
+            inner,
+            Operation::Iterator,
+            ProtocolStage::Read,
+        )))
     }
 }
 
