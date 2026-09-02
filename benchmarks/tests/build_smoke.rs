@@ -243,7 +243,18 @@ fn help_and_version_are_successful() {
     let help_stdout = std::str::from_utf8(&help.stdout).expect("help output must be UTF-8");
     assert!(help_stdout.contains("Usage:"));
     assert!(help_stdout.contains("kv_bench --help"));
-    assert!(help_stdout.contains("not implemented in stage B0"));
+    for command in ["run-one", "matrix", "report", "smoke"] {
+        assert!(
+            help_stdout.contains(command),
+            "help must document {command}"
+        );
+    }
+    assert!(!help_stdout.contains("kv_bench prepare"));
+    assert!(help_stdout.contains("cannot be overridden"));
+    assert!(
+        help_stdout.lines().all(|line| !line.starts_with('+')),
+        "help continuation lines must not contain patch markers"
+    );
 
     let version = run(&["--version"]);
     assert!(version.status.success());
@@ -264,12 +275,16 @@ fn help_and_version_are_successful() {
 }
 
 #[test]
-fn unsupported_or_missing_commands_fail_clearly() {
-    let unsupported = run(&["prepare"]);
-    assert_eq!(unsupported.status.code(), Some(2));
-    let unsupported_stderr =
-        String::from_utf8(unsupported.stderr).expect("error output must be UTF-8");
-    assert!(unsupported_stderr.contains("unsupported command in stage B0"));
+fn invalid_or_missing_commands_fail_clearly() {
+    let removed = run(&["prepare", "--workspace", "/tmp/removed"]);
+    assert_eq!(removed.status.code(), Some(2));
+    let removed_stderr = String::from_utf8(removed.stderr).expect("error output must be UTF-8");
+    assert!(removed_stderr.contains("unknown command \"prepare\""));
+
+    let unknown = run(&["unknown"]);
+    assert_eq!(unknown.status.code(), Some(2));
+    let unknown_stderr = String::from_utf8(unknown.stderr).expect("error output must be UTF-8");
+    assert!(unknown_stderr.contains("unknown command \"unknown\""));
 
     let extra = run(&["--version", "extra"]);
     assert_eq!(extra.status.code(), Some(2));

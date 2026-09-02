@@ -1,4 +1,5 @@
-//! Untimed full-dataset validation shared by template, warmup, and final checks.
+//! Untimed full-dataset validation shared by direct Load -> Run initial,
+//! prewarm, and final checks, plus the retained historical template tests.
 
 use std::error::Error;
 use std::fmt;
