@@ -41,7 +41,7 @@ use crate::lock::{
     open_io_error, sync_directory_tree_nofollow, sync_file_data, validate_directory_tree_nofollow,
 };
 #[cfg(not(test))]
-use crate::recovery::{analyze_recovery, execute_recovery};
+use crate::recovery::{analyze_recovery, execute_recovery, handoff_recovery_backend};
 #[cfg(not(test))]
 use crate::runtime::{ExternalLease, LifecycleController, OperationGuard, RuntimeControl};
 #[cfg(not(test))]
@@ -1485,18 +1485,27 @@ impl Db {
             ValueLogReader::new(Arc::clone(&files), VLogGeometry::PRODUCTION)
                 .map_err(open_recovery_error)?,
         );
-        let plan = analyze_recovery(&recovery_index, &format, &inventory, &reader)?;
-        let recovery = ValueLogRecovery::new(Arc::clone(&files)).map_err(open_recovery_error)?;
-        let recovered = execute_recovery(
-            &recovery_index,
-            plan,
-            &root_lock,
-            &format,
-            &reader,
-            recovery,
-        )?;
-
         let index_path = root_lock.canonical_path().join(INDEX_DIRECTORY_NAME);
+        let (index, recovered) = handoff_recovery_backend(
+            recovery_index,
+            |analysis_index| analyze_recovery(analysis_index, &format, &inventory, &reader),
+            || FjallBackend::open_existing(&index_path, options.fjall_index_options()),
+            |execution_index| validate_final_identity(execution_index, &format),
+            |execution_index, plan| {
+                let recovery =
+                    ValueLogRecovery::new(Arc::clone(&files)).map_err(open_recovery_error)?;
+                execute_recovery(
+                    execution_index,
+                    plan,
+                    &root_lock,
+                    &format,
+                    &reader,
+                    recovery,
+                )
+            },
+        )?;
+        let index = Arc::new(index);
+
         let stats = Arc::new(StatsState::new());
         let runtime = RuntimeControl::new(Arc::clone(&stats));
         let head_vlog_end = durable_end_position(recovered.durable_frontier.durable_vlog_end);
@@ -1521,16 +1530,10 @@ impl Db {
             values: reader as Arc<dyn ValueReader>,
         };
 
-        // Recovery and the complete Healthy runtime are now assembled against
-        // the one-shot index binding. Only at this point may Fjall start its
-        // flush/compaction workers. The binding is published before `Db`
-        // escapes, so public requests cannot observe the unbound state.
-        drop(recovery_index);
-        let index = Arc::new(FjallBackend::open_existing(
-            &index_path,
-            options.fjall_index_options(),
-        )?);
-        validate_final_identity(&index, &format)?;
+        // Recovery ran on this worker-enabled backend after its second identity
+        // validation. Publish the same handle to the completed runtime; no
+        // third Fjall open occurs and no public request can observe an unbound
+        // index.
         index_binding
             .bind(Arc::clone(&index))
             .map_err(|_| late_bound_index_error())?;

@@ -3,7 +3,7 @@
 ## 全局约束
 
 1. 唯一性能执行规范是 `/Users/Admin/work/kv/benchmark_plan.md`，SHA-256 必须与 [`04_Benchmark分阶段实现方案.md`](./04_Benchmark分阶段实现方案.md) 记录值一致。
-2. RustKV API 语义只以 `/Users/Admin/work/kv/系统设计文档_v2.md` 为准，SHA-256 必须为 `29c3f572ed051f09665fe178f4d0ab180417069f8e7968ebf829fd43dc56b3fd`。
+2. RustKV API 语义只以 `/Users/Admin/work/kv/系统设计文档_v2.md` 为准，SHA-256 必须为 `e5cbc3517f20874bd83bb13bd694b9f4ee74b37863f16fd6927dea22287ea21e`。
 3. 所有代码均放在 `/Users/Admin/work/kv/rustkv/benchmarks/`；它是 RustKV Git 仓库内的独立 Rust 子 crate，不建立嵌套 Git 仓库。
 4. 不得修改 RustKV 根 crate 的 `src/`、`tests/`、`Cargo.toml` 或 `Cargo.lock`。
 5. 本阶段只搭建可编译、可链接、可测试的骨架，不实现任何性能负载。

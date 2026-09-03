@@ -20,7 +20,7 @@
 - 唯一性能执行规范：`/Users/Admin/work/kv/benchmark_plan.md`
 - Benchmark 方案 SHA-256：`b98a2f8b5a0b3e42311a1f81f874364de5a51738c826ebcd9cd38e28ca2ca5cd`
 - RustKV 语义规范：`/Users/Admin/work/kv/系统设计文档_v2.md`
-- 系统设计 SHA-256：`29c3f572ed051f09665fe178f4d0ab180417069f8e7968ebf829fd43dc56b3fd`
+- 系统设计 SHA-256：`e5cbc3517f20874bd83bb13bd694b9f4ee74b37863f16fd6927dea22287ea21e`
 - 需求背景：`/Users/Admin/work/kv/需求分析文档_v2.md`
 - Benchmark 工程：`/Users/Admin/work/kv/rustkv/benchmarks`
 - RustKV 工程：`/Users/Admin/work/kv/rustkv`

@@ -202,6 +202,8 @@ pub(crate) struct FjallBackend {
     last_commit_entered: AtomicBool,
     #[cfg(test)]
     iterator_error_after: Mutex<Option<usize>>,
+    #[cfg(test)]
+    background_workers_enabled: bool,
 }
 
 /// A Destroy-only read view recovered inside an isolated shadow directory.
@@ -314,10 +316,10 @@ impl FjallBackend {
     /// Creates the container for the ordered database-open preparation path.
     ///
     /// Fjall normally starts its flush/compaction pool from `Database::open`.
-    /// Stage 7 must finish identity validation and recovery before any background
-    /// worker can run, so this entry point deliberately opens Fjall with a
-    /// zero-sized worker pool. Later lifecycle assembly must activate or reopen
-    /// the backend only after the remaining open steps have succeeded.
+    /// Identity/layout validation and read-only recovery analysis must finish
+    /// before any background worker can run, so this entry point deliberately
+    /// opens Fjall with a zero-sized worker pool. Recovery execution reopens the
+    /// same index with normal workers so Fjall can service commit backpressure.
     pub(crate) fn create_for_open_preparation(
         path: &Path,
         options: FjallIndexOptions,
@@ -429,6 +431,8 @@ impl FjallBackend {
             last_commit_entered: AtomicBool::new(false),
             #[cfg(test)]
             iterator_error_after: Mutex::new(None),
+            #[cfg(test)]
+            background_workers_enabled: background_worker_mode == BackgroundWorkerMode::Enabled,
         })
     }
 
@@ -530,8 +534,33 @@ impl FjallBackend {
     }
 
     #[cfg(test)]
+    pub(crate) fn rotate_internal_memtable_without_wait(
+        &self,
+        space: InternalIndexSpace,
+    ) -> Result<bool> {
+        self.keyspace(space).rotate_memtable().map_err(|error| {
+            storage_error_from_fjall(error, Operation::WriteBatch, ProtocolStage::IndexCommit)
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn outstanding_flushes(&self) -> usize {
         self.database.outstanding_flushes()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn user_sealed_memtable_count(&self) -> usize {
+        self.user.sealed_memtable_count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn internal_sealed_memtable_count(&self, space: InternalIndexSpace) -> usize {
+        self.keyspace(space).sealed_memtable_count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn background_workers_enabled(&self) -> bool {
+        self.background_workers_enabled
     }
 
     #[cfg(test)]

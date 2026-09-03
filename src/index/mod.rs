@@ -680,12 +680,12 @@ mod fjall;
 
 pub(crate) type FjallBackend = fjall::FjallBackend;
 
-/// Runtime index capability assembled before Fjall background workers start.
+/// Runtime index capability assembled only after Fjall recovery succeeds.
 ///
 /// Fjall 3.1.8 starts its worker pool inside `Database::open` and does not
-/// expose a separate activation method. `Db::open` therefore builds every
-/// component that depends on the index against this one-shot binding, then
-/// opens the worker-enabled Fjall handle and publishes it here before the
+/// expose a separate activation method. `Db::open` therefore performs its
+/// read-only analysis on a separate zero-worker handle, reopens with workers,
+/// executes recovery, and publishes that same recovered handle here before the
 /// public `Db` can escape.
 pub(crate) struct LateBoundFjallBackend {
     backend: std::sync::OnceLock<std::sync::Arc<FjallBackend>>,

@@ -4,8 +4,11 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
 #[path = "../src/error.rs"]
 mod error;
@@ -82,6 +85,12 @@ use vlog::writer::{AppendStateSnapshot, ValueLogRecovery, ValueLogWriter, Writer
 type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 const DATABASE_UUID: [u8; 16] = [0x63; 16];
+const BACKPRESSURE_CHILD_MODE: &str = "RUSTKV_RECOVERY_BACKPRESSURE_CHILD_MODE";
+const BACKPRESSURE_CHILD_MARKER: &str = "RUSTKV_RECOVERY_BACKPRESSURE_CHILD_MARKER";
+const ZERO_WORKER_MODE: &str = "zero-worker";
+const ENABLED_WORKER_MODE: &str = "enabled-worker";
+const PUBLIC_OPEN_BACKPRESSURE_CHILD: &str = "RUSTKV_PUBLIC_OPEN_BACKPRESSURE_CHILD";
+const PUBLIC_OPEN_BACKPRESSURE_PATH: &str = "RUSTKV_PUBLIC_OPEN_BACKPRESSURE_PATH";
 
 struct FixedUuid(u8);
 
@@ -213,6 +222,15 @@ impl Harness {
     fn reopen_backend(&mut self) -> TestResult {
         drop(self.backend.take());
         self.backend = Some(Arc::new(FjallBackend::open_existing_for_open_preparation(
+            &self.index_path,
+            fjall_options(),
+        )?));
+        Ok(())
+    }
+
+    fn reopen_backend_with_workers(&mut self) -> TestResult {
+        drop(self.backend.take());
+        self.backend = Some(Arc::new(FjallBackend::open_existing(
             &self.index_path,
             fjall_options(),
         )?));
@@ -406,6 +424,199 @@ fn encoded_mutation_key(commit_seq: u64, ordinal: u64) -> Vec<u8> {
     key[10] = 1;
     key[11..19].copy_from_slice(&ordinal.to_be_bytes());
     key
+}
+
+fn prepare_and_execute_backpressured_recovery(enable_workers: bool) -> TestResult {
+    let mut harness = Harness::new()?;
+    harness.put(b"shared", b"stable", true)?;
+    harness.put(b"shared", b"rejected", false)?;
+    harness.finish_writes();
+
+    let baseline = harness.analyze()?;
+    harness.flip_value_byte(&baseline.descriptors[0])?;
+    let io = Arc::new(RecoveryIo::default());
+    let (plan, reader, vlog) = harness.recovery_inputs(io)?;
+    assert_eq!((plan.durable_frontier.durable_seq, plan.head_seq), (1, 2));
+    assert_eq!(plan.accepted_seq, 1);
+    assert!(plan.needs_undo && plan.needs_trim);
+
+    for ordinal in 0_u8..4 {
+        let key = [b'p', ordinal];
+        harness
+            .backend()
+            .insert_without_keyspace_durability(None, &key, b"pressure")?;
+        assert!(harness.backend().rotate_user_memtable_without_wait()?);
+    }
+    assert_eq!(harness.backend().user_sealed_memtable_count(), 4);
+    assert!(harness.backend().outstanding_flushes() >= 4);
+
+    if enable_workers {
+        harness.reopen_backend_with_workers()?;
+    }
+    assert_eq!(
+        harness.backend().background_workers_enabled(),
+        enable_workers
+    );
+    let marker =
+        std::env::var_os(BACKPRESSURE_CHILD_MARKER).ok_or("missing backpressure child marker")?;
+    std::fs::write(marker, b"execute")?;
+
+    let recovered = harness.execute_inputs(plan, &reader, vlog)?;
+    assert_eq!(recovered.head_seq, 1);
+    assert_eq!(recovered.durable_frontier.durable_seq, 1);
+    drop(recovered.writer);
+    assert_eq!(harness.read_value(b"shared")?, Some(b"stable".to_vec()));
+    Ok(())
+}
+
+fn spawn_backpressure_child(mode: &str, marker: &Path) -> io::Result<Child> {
+    Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "recovery_commit_backpressure_requires_worker_handoff",
+            "--nocapture",
+        ])
+        .env(BACKPRESSURE_CHILD_MODE, mode)
+        .env(BACKPRESSURE_CHILD_MARKER, marker)
+        .spawn()
+}
+
+fn wait_for_child_marker(child: &mut Child, marker: &Path, timeout: Duration) -> io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if marker.exists() {
+            return Ok(());
+        }
+        if let Some(status) = child.try_wait()? {
+            return Err(io::Error::other(format!(
+                "backpressure child exited as {status} before execute"
+            )));
+        }
+        if Instant::now() >= deadline {
+            child.kill()?;
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "backpressure child did not reach execute",
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> io::Result<Option<ExitStatus>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if Instant::now() >= deadline {
+            child.kill()?;
+            let _ = child.wait();
+            return Ok(None);
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn recovery_commit_backpressure_requires_worker_handoff() -> TestResult {
+    if let Some(mode) = std::env::var_os(BACKPRESSURE_CHILD_MODE) {
+        return match mode.to_str().ok_or("invalid backpressure child mode")? {
+            ZERO_WORKER_MODE => prepare_and_execute_backpressured_recovery(false),
+            ENABLED_WORKER_MODE => prepare_and_execute_backpressured_recovery(true),
+            _ => Err("unknown backpressure child mode".into()),
+        };
+    }
+
+    let markers = tempfile::tempdir()?;
+    let zero_marker = markers.path().join("zero-worker");
+    let mut zero_worker = spawn_backpressure_child(ZERO_WORKER_MODE, &zero_marker)?;
+    wait_for_child_marker(&mut zero_worker, &zero_marker, Duration::from_secs(15))?;
+    assert!(
+        wait_for_child_exit(&mut zero_worker, Duration::from_secs(2))?.is_none(),
+        "the zero-worker control unexpectedly escaped Fjall local_backpressure"
+    );
+
+    let enabled_marker = markers.path().join("enabled-worker");
+    let mut enabled_worker = spawn_backpressure_child(ENABLED_WORKER_MODE, &enabled_marker)?;
+    wait_for_child_marker(
+        &mut enabled_worker,
+        &enabled_marker,
+        Duration::from_secs(15),
+    )?;
+    let status = wait_for_child_exit(&mut enabled_worker, Duration::from_secs(15))?
+        .ok_or("worker-enabled recovery did not complete before timeout")?;
+    assert!(status.success(), "worker-enabled child failed as {status}");
+    Ok(())
+}
+
+#[test]
+fn public_db_open_recovers_with_four_sealed_system_memtables() -> TestResult {
+    if std::env::var_os(PUBLIC_OPEN_BACKPRESSURE_CHILD).is_some() {
+        let root = std::env::var_os(PUBLIC_OPEN_BACKPRESSURE_PATH)
+            .ok_or("missing public Open backpressure path")?;
+        let db = rustkv::Db::open(&rustkv::Options::default(), root)?;
+        assert_eq!(
+            db.get(&rustkv::ReadOptions::default(), b"stable")?,
+            Some(b"prefix".to_vec())
+        );
+        assert_eq!(
+            db.get(&rustkv::ReadOptions::default(), b"tail")?,
+            Some(b"accepted".to_vec())
+        );
+        let stats = db.stats();
+        assert_eq!((stats.head_seq, stats.durable_seq), (2, 2));
+        assert_eq!(stats.durability_lag, 0);
+        return Ok(());
+    }
+
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("db");
+    {
+        let options = rustkv::Options {
+            create_if_missing: true,
+            write_buffer_size: 64 * 1024,
+            ..rustkv::Options::default()
+        };
+        let db = rustkv::Db::open(&options, &root)?;
+        db.put(&rustkv::WriteOptions { sync: true }, b"stable", b"prefix")?;
+        db.put(&rustkv::WriteOptions::default(), b"tail", b"accepted")?;
+    }
+
+    let backend =
+        FjallBackend::open_existing_for_open_preparation(&root.join("index"), fjall_options())?;
+    let encoded_head = backend
+        .get_internal(InternalIndexSpace::System, HEAD_SEQ_KEY)?
+        .ok_or("missing HeadSeq")?;
+    while backend.internal_sealed_memtable_count(InternalIndexSpace::System) < 4 {
+        backend.insert_without_keyspace_durability(
+            Some(InternalIndexSpace::System),
+            HEAD_SEQ_KEY,
+            &encoded_head,
+        )?;
+        assert!(backend.rotate_internal_memtable_without_wait(InternalIndexSpace::System)?);
+    }
+    assert_eq!(
+        backend.internal_sealed_memtable_count(InternalIndexSpace::System),
+        4
+    );
+    assert!(backend.outstanding_flushes() >= 4);
+    drop(backend);
+
+    let mut child = Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "public_db_open_recovers_with_four_sealed_system_memtables",
+            "--nocapture",
+        ])
+        .env(PUBLIC_OPEN_BACKPRESSURE_CHILD, "1")
+        .env(PUBLIC_OPEN_BACKPRESSURE_PATH, &root)
+        .spawn()?;
+    let status = wait_for_child_exit(&mut child, Duration::from_secs(20))?
+        .ok_or("public Db::open remained blocked by Fjall backpressure")?;
+    assert!(status.success(), "public Open child failed as {status}");
+    Ok(())
 }
 
 #[test]

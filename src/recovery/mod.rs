@@ -49,6 +49,28 @@ pub(crate) struct RecoveryPlan {
     pub(crate) needs_trim: bool,
 }
 
+/// Transfers Open from its read-only, zero-worker analysis backend to the
+/// worker-enabled backend that both executes recovery and serves the runtime.
+///
+/// Keeping this ordering in one function makes two safety properties explicit:
+/// an analysis failure cannot create the worker-enabled backend, and recovery
+/// execution cannot begin until that backend has passed its own validation.
+pub(crate) fn handoff_recovery_backend<A, E, P: 'static, R>(
+    analysis_backend: A,
+    analyze: impl FnOnce(&A) -> Result<P>,
+    open_execution_backend: impl FnOnce() -> Result<E>,
+    validate_execution_backend: impl FnOnce(&E) -> Result<()>,
+    execute: impl FnOnce(&E, P) -> Result<R>,
+) -> Result<(E, R)> {
+    let plan = analyze(&analysis_backend)?;
+    drop(analysis_backend);
+
+    let execution_backend = open_execution_backend()?;
+    validate_execution_backend(&execution_backend)?;
+    let recovered = execute(&execution_backend, plan)?;
+    Ok((execution_backend, recovered))
+}
+
 pub(crate) struct RecoveredState {
     pub(crate) head_seq: u64,
     pub(crate) durable_frontier: DurableFrontier,
@@ -1073,4 +1095,130 @@ fn recovery_resource() -> StorageError {
         None,
         RetryAdvice::RetrySameInstance,
     )
+}
+
+#[cfg(test)]
+mod handoff_tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    struct TrackedBackend {
+        name: &'static str,
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl Drop for TrackedBackend {
+        fn drop(&mut self) {
+            let event = if self.name == "analysis" {
+                "drop-analysis"
+            } else {
+                "drop-execution"
+            };
+            self.events
+                .lock()
+                .expect("event mutex poisoned")
+                .push(event);
+        }
+    }
+
+    #[test]
+    fn recovery_plan_contains_no_borrowed_open_state() {
+        fn assert_owned<T: Send + 'static>() {}
+        assert_owned::<RecoveryPlan>();
+    }
+
+    #[test]
+    fn handoff_drops_analysis_backend_before_open_and_executes_after_validation() -> Result<()> {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let analysis = TrackedBackend {
+            name: "analysis",
+            events: Arc::clone(&events),
+        };
+
+        let (execution, result) = handoff_recovery_backend(
+            analysis,
+            |_| {
+                events.lock().expect("event mutex poisoned").push("analyze");
+                Ok(Vec::from(b"owned-plan".as_slice()))
+            },
+            || {
+                events.lock().expect("event mutex poisoned").push("open");
+                Ok(TrackedBackend {
+                    name: "execution",
+                    events: Arc::clone(&events),
+                })
+            },
+            |_| {
+                events
+                    .lock()
+                    .expect("event mutex poisoned")
+                    .push("validate");
+                Ok(())
+            },
+            |backend, plan| {
+                assert_eq!(backend.name, "execution");
+                assert_eq!(plan, b"owned-plan");
+                events.lock().expect("event mutex poisoned").push("execute");
+                Ok(17_u64)
+            },
+        )?;
+
+        assert_eq!(result, 17);
+        assert_eq!(
+            *events.lock().expect("event mutex poisoned"),
+            ["analyze", "drop-analysis", "open", "validate", "execute"]
+        );
+        drop(execution);
+        assert_eq!(
+            *events.lock().expect("event mutex poisoned"),
+            [
+                "analyze",
+                "drop-analysis",
+                "open",
+                "validate",
+                "execute",
+                "drop-execution"
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_analysis_never_opens_execution_backend() {
+        let open_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = Arc::clone(&open_called);
+        let result = handoff_recovery_backend(
+            (),
+            |_| Err::<Vec<u8>, _>(recovery_corruption()),
+            || {
+                observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+            |_| Ok(()),
+            |_, _| Ok(()),
+        );
+
+        assert!(result.is_err());
+        assert!(!open_called.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn failed_second_validation_never_executes_recovery() {
+        let execute_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = Arc::clone(&execute_called);
+        let result = handoff_recovery_backend(
+            (),
+            |_| Ok(Vec::<u8>::new()),
+            || Ok(()),
+            |_| Err(recovery_corruption()),
+            |_, _| {
+                observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(!execute_called.load(std::sync::atomic::Ordering::SeqCst));
+    }
 }
