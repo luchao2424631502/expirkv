@@ -7,6 +7,7 @@ mod backend;
 mod cli;
 mod config;
 mod csv;
+mod custom;
 mod fs;
 mod key;
 mod matrix;
@@ -28,6 +29,10 @@ pub use backend::{
 pub use cli::{CliCommand, CliError, execute_cli, parse_cli};
 pub use config::{BenchConfig, BenchMode};
 pub use csv::{CSV_COLUMNS, CsvError, CsvFile, CsvRow, ResumeIdentity, require_exact_matrix};
+pub use custom::{
+    CUSTOM_CSV_COLUMNS, CustomRunError, CustomRunOutcome, CustomRunRow, CustomRunSpec,
+    execute_custom_run,
+};
 pub use fs::{BenchmarkWorkspace, DatabaseDirectory, FsError, FsErrorKind};
 pub use key::{KEY_LENGTH, KeyCodecError, decode_key, encode_key, fixed_value};
 pub use matrix::{
@@ -70,6 +75,7 @@ pub fn help_text() -> &'static str {
         "RustKV/LevelDB benchmark driver\n\n",
         "Usage:\n",
         "  kv_bench run-one --workspace ABS_PATH --csv ABS_PATH --backend rustkv|leveldb \\\n       --workload NAME --threads 1|10|100|1000 --repetition 0..4 \\\n       --rustkv-commit FULL_SHA --environment-id ID\n",
+        "  kv_bench custom-run --output-dir ABS_PATH --backend rustkv|leveldb \\\n       --workload NAME --threads 1|10|100|1000 --records N \\\n       --rustkv-commit FULL_SHA --worktree-state clean|dirty\n",
         "  kv_bench matrix --dry-run\n",
         "  kv_bench matrix --workspace ABS_PATH --csv ABS_PATH --rustkv-commit FULL_SHA \\\n       --environment-id ID [--resume]\n",
         "  kv_bench report --csv ABS_PATH --output-dir ABS_PATH\n",
@@ -77,6 +83,7 @@ pub fn help_text() -> &'static str {
         "  kv_bench --help\n",
         "  kv_bench --version\n\n",
         "Formal configuration is compiled in and cannot be overridden.\n",
+        "custom-run is explicitly non-formal and uses a separate result schema.\n",
     )
 }
 

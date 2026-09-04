@@ -243,7 +243,7 @@ fn help_and_version_are_successful() {
     let help_stdout = std::str::from_utf8(&help.stdout).expect("help output must be UTF-8");
     assert!(help_stdout.contains("Usage:"));
     assert!(help_stdout.contains("kv_bench --help"));
-    for command in ["run-one", "matrix", "report", "smoke"] {
+    for command in ["run-one", "custom-run", "matrix", "report", "smoke"] {
         assert!(
             help_stdout.contains(command),
             "help must document {command}"

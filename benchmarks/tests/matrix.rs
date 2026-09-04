@@ -242,8 +242,10 @@ fn final_execution_sources_have_no_template_copy_or_prepare_dependency() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for relative in [
         "src/cli.rs",
+        "src/custom.rs",
         "src/matrix.rs",
         "src/run_unit.rs",
+        "scripts/run_custom.sh",
         "scripts/run_smoke.sh",
     ] {
         let source = std::fs::read_to_string(manifest.join(relative)).unwrap();

@@ -83,6 +83,29 @@ impl RunUnit {
             })
     }
 
+    pub(crate) fn custom(
+        backend: BackendKind,
+        workload: Workload,
+        thread_count: usize,
+    ) -> Result<Self, MatrixError> {
+        if !BenchConfig::formal()
+            .thread_counts()
+            .contains(&thread_count)
+        {
+            return Err(MatrixError::InvalidUnit(format!(
+                "custom thread count {thread_count} is not one of 1, 10, 100, 1000"
+            )));
+        }
+        Ok(Self {
+            mode: BenchMode::Smoke,
+            backend,
+            workload,
+            thread_count,
+            repetition: 0,
+            combination_index: 0,
+        })
+    }
+
     pub fn id(self) -> RunId {
         RunId::new(
             self.mode,

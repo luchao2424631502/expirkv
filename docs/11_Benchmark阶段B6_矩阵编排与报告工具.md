@@ -134,3 +134,7 @@ git diff -- benchmarks docs
 3. 240 项 dry-run 统计与所有单元/golden 测试结果。
 4. 双 Backend smoke 的正确性结果及输出目录。
 5. 明确写出“等待用户 Review，尚未提交”。
+
+## 验收后附加说明
+
+B6 已于提交 `5d0c3958408bbb99384e6e8ac8ace3da5afd790a` 验收。此后用户要求增加单项自定义规模测试：`custom-run` 和 `scripts/run_custom.sh` 一次只执行用户指定的一个 Backend、负载、线程数和条目数。该入口复用本阶段逐 RunUnit 生命周期，但使用独立 `mode=custom` 结果格式，属于非正式辅助能力；本阶段冻结的正式 `run-one/matrix/report` 语义和 B7 正式矩阵不变，自定义结果不得进入正式报告。

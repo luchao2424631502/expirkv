@@ -9,8 +9,9 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use crate::{
-    BackendKind, BenchConfig, ExecutionMetadata, RunUnit, Workload, execute_units, formal_matrix,
-    generate_formal_report, generate_smoke_report, smoke_matrix,
+    BackendKind, BenchConfig, CustomRunSpec, ExecutionMetadata, RunUnit, Workload,
+    execute_custom_run, execute_units, formal_matrix, generate_formal_report,
+    generate_smoke_report, smoke_matrix,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -26,6 +27,15 @@ pub enum CliCommand {
         repetition: u32,
         rustkv_commit: String,
         environment_id: String,
+    },
+    CustomRun {
+        output_directory: PathBuf,
+        backend: BackendKind,
+        workload: Workload,
+        thread_count: usize,
+        record_count: u64,
+        rustkv_commit: String,
+        worktree_state: String,
     },
     MatrixDryRun,
     Matrix {
@@ -94,6 +104,30 @@ where
                 environment_id: parse_environment_id(parsed.required("environment-id")?)?,
             })
         }
+        "custom-run" => {
+            let parsed = ParsedOptions::new(
+                rest,
+                &[
+                    "output-dir",
+                    "backend",
+                    "workload",
+                    "threads",
+                    "records",
+                    "rustkv-commit",
+                    "worktree-state",
+                ],
+                &[],
+            )?;
+            Ok(CliCommand::CustomRun {
+                output_directory: absolute_path(parsed.required("output-dir")?, "output-dir")?,
+                backend: parse_value(parsed.required("backend")?, "backend")?,
+                workload: parse_value(parsed.required("workload")?, "workload")?,
+                thread_count: parse_thread_count(parsed.required("threads")?)?,
+                record_count: parse_custom_record_count(parsed.required("records")?)?,
+                rustkv_commit: parse_commit(parsed.required("rustkv-commit")?)?,
+                worktree_state: parse_worktree_state(parsed.required("worktree-state")?)?,
+            })
+        }
         "matrix" if rest == ["--dry-run"] => Ok(CliCommand::MatrixDryRun),
         "matrix" => {
             let parsed = ParsedOptions::new(
@@ -159,6 +193,31 @@ pub fn execute_cli(command: CliCommand) -> Result<String, CliError> {
             )
             .map_err(|error| CliError::Runtime(error.to_string()))?;
             Ok(format!("mode=formal completed {}\n", unit.id()))
+        }
+        CliCommand::CustomRun {
+            output_directory,
+            backend,
+            workload,
+            thread_count,
+            record_count,
+            rustkv_commit,
+            worktree_state,
+        } => {
+            let outcome = execute_custom_run(&CustomRunSpec {
+                output_directory,
+                record_count,
+                backend,
+                workload,
+                thread_count,
+                rustkv_commit,
+                worktree_state,
+            })
+            .map_err(|error| CliError::Runtime(error.to_string()))?;
+            Ok(format!(
+                "mode=custom csv={} summary={}\n",
+                outcome.csv_path.display(),
+                outcome.summary_path.display()
+            ))
         }
         CliCommand::MatrixDryRun => {
             let mut output = String::new();
@@ -405,6 +464,17 @@ fn parse_repetition(value: &str) -> Result<u32, CliError> {
     }
 }
 
+fn parse_custom_record_count(value: &str) -> Result<u64, CliError> {
+    let record_count: u64 = parse_value(value, "records")?;
+    if record_count >= 100 && record_count.is_multiple_of(100) {
+        Ok(record_count)
+    } else {
+        Err(CliError::Usage(
+            "--records must be at least 100 and divisible by 100".to_owned(),
+        ))
+    }
+}
+
 fn parse_commit(value: &str) -> Result<String, CliError> {
     if value.len() == 40
         && value
@@ -429,6 +499,16 @@ fn parse_environment_id(value: &str) -> Result<String, CliError> {
     } else {
         Err(CliError::Usage(
             "--environment-id must use ASCII letters, digits, '.', '-' or '_'".to_owned(),
+        ))
+    }
+}
+
+fn parse_worktree_state(value: &str) -> Result<String, CliError> {
+    if matches!(value, "clean" | "dirty") {
+        Ok(value.to_owned())
+    } else {
+        Err(CliError::Usage(
+            "--worktree-state must be clean or dirty".to_owned(),
         ))
     }
 }

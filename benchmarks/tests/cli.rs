@@ -19,6 +19,7 @@ fn every_subcommand_parses_to_strong_types() {
     let help = kv_bench::help_text();
     assert!(!help.contains("kv_bench prepare"));
     assert!(help.contains("run-one"));
+    assert!(help.contains("custom-run"));
     assert!(help.contains("matrix"));
     assert!(help.contains("report"));
     assert!(help.contains("smoke"));
@@ -53,6 +54,35 @@ fn every_subcommand_parses_to_strong_types() {
             repetition: 4,
             rustkv_commit: COMMIT.to_owned(),
             environment_id: "mac.m1-test".to_owned(),
+        }
+    );
+    assert_eq!(
+        parse_cli(args(&[
+            "custom-run",
+            "--output-dir",
+            "/tmp/custom-result",
+            "--backend",
+            "rustkv",
+            "--workload",
+            "single_put",
+            "--threads",
+            "10",
+            "--records",
+            "100000",
+            "--rustkv-commit",
+            COMMIT,
+            "--worktree-state",
+            "dirty",
+        ]))
+        .unwrap(),
+        CliCommand::CustomRun {
+            output_directory: temp_path("custom-result"),
+            backend: BackendKind::RustKv,
+            workload: Workload::SinglePut,
+            thread_count: 10,
+            record_count: 100_000,
+            rustkv_commit: COMMIT.to_owned(),
+            worktree_state: "dirty".to_owned(),
         }
     );
     assert_eq!(
@@ -105,6 +135,7 @@ fn missing_unknown_duplicate_and_positional_arguments_are_usage_errors() {
             "unknown command",
         ),
         (vec!["run-one"], "missing required option --workspace"),
+        (vec!["custom-run"], "missing required option --output-dir"),
         (
             vec!["run-one", "unexpected-positional"],
             "unexpected positional argument",
@@ -204,6 +235,37 @@ fn invalid_typed_values_and_conflicting_paths_are_rejected() {
         Err(CliError::Usage(message)) if message.contains("paths conflict")
     ));
     std::fs::remove_dir_all(conflict_root).unwrap();
+
+    let custom = [
+        "custom-run",
+        "--output-dir",
+        "/tmp/custom",
+        "--backend",
+        "rustkv",
+        "--workload",
+        "random_get",
+        "--threads",
+        "1",
+        "--records",
+        "1000",
+        "--rustkv-commit",
+        COMMIT,
+        "--worktree-state",
+        "clean",
+    ];
+    for (position, invalid) in [
+        (4, "other"),
+        (6, "get"),
+        (8, "2"),
+        (10, "99"),
+        (10, "150"),
+        (12, "short"),
+        (14, "unknown"),
+    ] {
+        let mut changed = custom;
+        changed[position] = invalid;
+        assert!(parse_cli(args(&changed)).is_err(), "accepted {invalid}");
+    }
 }
 
 #[test]

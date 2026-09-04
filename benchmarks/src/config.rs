@@ -90,6 +90,23 @@ impl BenchConfig {
         }
     }
 
+    /// Builds one explicitly non-formal, caller-sized custom RunUnit.
+    /// Public argument validation is performed before this constructor.
+    pub(crate) fn custom(record_count: u64) -> Self {
+        debug_assert!(record_count >= 100);
+        debug_assert!(record_count.is_multiple_of(100));
+        Self {
+            mode: BenchMode::Smoke,
+            record_count,
+            range_length: 100,
+            batch_size: 100,
+            repetitions: 1,
+            random_get_operations: record_count,
+            range_scan_operations: record_count / 100,
+            ..Self::formal()
+        }
+    }
+
     pub const fn mode(&self) -> BenchMode {
         self.mode
     }
