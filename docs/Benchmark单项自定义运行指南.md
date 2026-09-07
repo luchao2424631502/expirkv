@@ -102,42 +102,45 @@ Trace → 新目录 → Load或空库 → 关闭 → 重开验证初态 → 关�
 | `report` | 严格读取正式矩阵CSV并生成最终报告 |
 | `smoke` | 固定小规模功能验证，不用于性能结论 |
 
-## 7. 自定义规模批量脚本
+## 7. 全负载三次重复批量脚本
 
-已经单独完成单线程 `single_put` 和 `batch_put` 后，可用下面的脚本先补齐双方 Backend 的其余单线程负载，再执行10、100、1000线程下的六种完整负载矩阵：
+使用下面的脚本可对双方 Backend、四种数据量、四种线程数和全部六类负载执行完整的自定义矩阵。每个有效组合固定运行三次：
 
 ```bash
 cd /Users/Admin/work/kv/rustkv/benchmarks
-caffeinate -i ./scripts/run_remaining_t1.sh \
+caffeinate -i ./scripts/run_all_workload.sh \
   --output-root "$HOME/work/result"
 ```
 
-脚本依次执行：
+脚本执行范围：
 
-- 单线程部分：`2 Backend × 4 workload × 4 数据量 = 32` 个 RunUnit，不重复已经完成的单线程 `single_put` 和 `batch_put`；
-- 并发部分：双方 Backend、六种 workload、1万/10万/100万/1000万数据量，以及10/100/1000线程；
-- 1万数据量、1000线程下的 `range_scan`、`batch_put`、`batch_delete` 只有100个请求，无法让1000个线程实际参与，因此双方共6项明确跳过；
-- 最终执行170个有效 RunUnit，另输出6条明确的跳过记录。
+- Backend：`rustkv`、`leveldb`；
+- workload：`random_get`、`range_scan`、`single_put`、`batch_put`、`single_delete`、`batch_delete`；
+- 数据量：1万、10万、100万、1000万；
+- 线程数：1、10、100、1000；
+- 重复次数：每个有效组合3次，三次使用相同参数和固定Trace。
+
+矩阵共有192个组合。1万数据量、1000线程下的 `range_scan`、`batch_put`、`batch_delete` 只有100个请求，无法让1000个线程实际参与，因此双方共6个组合整体跳过，相当于省略18次重复。剩余186个组合各执行3次，共558个实际 RunUnit。
 
 输出目录示例：
 
 ```text
-leveldb_random_get_1w_t1
-rustkv_range_scan_10w_t1
-leveldb_single_delete_100w_t1
-rustkv_batch_delete_1000w_t1
-leveldb_single_put_10w_t100
-rustkv_random_get_1000w_t1000
+leveldb_random_get_1w_t1/repetition_1/result.csv
+leveldb_random_get_1w_t1/repetition_2/result.csv
+leveldb_random_get_1w_t1/repetition_3/result.csv
+rustkv_range_scan_10w_t10/repetition_1/result.csv
+leveldb_single_put_100w_t100/repetition_2/result.csv
+rustkv_random_get_1000w_t1000/repetition_3/result.csv
 ```
 
 运行前可只查看完整清单，不创建目录、不执行 Benchmark：
 
 ```bash
-./scripts/run_remaining_t1.sh \
+./scripts/run_all_workload.sh \
   --output-root "$HOME/work/result" \
   --dry-run
 ```
 
-目录统一使用 `<backend>_<workload>_<数据量标签>_t<线程数>`。脚本遇到已经完整成功的同名结果时会跳过；遇到不完整或参数不匹配的同名目录时会保留目录并停止，不会覆盖或删除已有结果。任一 RunUnit 失败时整套执行立即停止。
+同一组合统一放在 `<backend>_<workload>_<数据量标签>_t<线程数>` 目录中，并写入 `combination.txt` 固定组合身份；三次结果分别放在 `repetition_1`、`repetition_2`、`repetition_3` 子目录。脚本遇到已经完整成功且参数匹配的重复结果时会跳过；遇到组合身份、重复结果不完整或参数不匹配时会保留现场并停止，不会覆盖或删除已有结果。任一 RunUnit 失败时整套执行立即停止。
 
 不要同时运行其他 Benchmark；并发运行会争抢 CPU、内存和磁盘，使结果失真。

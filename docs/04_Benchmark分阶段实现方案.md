@@ -2,16 +2,7 @@
 
 ## 1. 文档定位
 
-本文档是 RustKV/LevelDB 性能对比工作的实施总纲。具体实现必须逐阶段使用以下执行文档：
-
-1. [`05_Benchmark阶段B0_工程骨架与构建基线.md`](./05_Benchmark阶段B0_工程骨架与构建基线.md)
-2. [`06_Benchmark阶段B1_固定数据与Trace.md`](./06_Benchmark阶段B1_固定数据与Trace.md)
-3. [`07_Benchmark阶段B2_双后端适配.md`](./07_Benchmark阶段B2_双后端适配.md)
-4. [`08_Benchmark阶段B3_并发执行与统计.md`](./08_Benchmark阶段B3_并发执行与统计.md)
-5. [`09_Benchmark阶段B4_六类负载.md`](./09_Benchmark阶段B4_六类负载.md)
-6. [`10_Benchmark阶段B5_模板恢复与正确性验证.md`](./10_Benchmark阶段B5_模板恢复与正确性验证.md)
-7. [`11_Benchmark阶段B6_矩阵编排与报告工具.md`](./11_Benchmark阶段B6_矩阵编排与报告工具.md)
-8. [`12_Benchmark阶段B7_Mac正式跑测与报告.md`](./12_Benchmark阶段B7_Mac正式跑测与报告.md)
+本文档是 RustKV/LevelDB 性能对比工作的实施总纲。B0 至 B7 的具体执行要求统一收录于 [`Benchmark实际各阶段执行方案.md`](./Benchmark实际各阶段执行方案.md)，必须按其中阶段顺序执行。
 
 每次只能执行一个阶段。测试完成后必须先交由用户 Review；无论测试成功或失败，未经用户明确确认均不得提交。
 

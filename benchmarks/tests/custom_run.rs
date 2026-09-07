@@ -201,8 +201,8 @@ fn shell_is_valid_and_documents_exactly_one_user_selected_rununit() {
 }
 
 #[test]
-fn remaining_script_expands_170_runs_and_the_six_required_skips() {
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/run_remaining_t1.sh");
+fn all_workload_script_expands_three_repetitions_and_six_required_skips() {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/run_all_workload.sh");
     assert!(
         Command::new("sh")
             .arg("-n")
@@ -212,7 +212,7 @@ fn remaining_script_expands_170_runs_and_the_six_required_skips() {
             .success()
     );
 
-    let temp = TempDirectory::new("remaining-dry-run");
+    let temp = TempDirectory::new("all-workload-dry-run");
     let output_root = temp.path().join("output");
     let output = Command::new("sh")
         .arg(&script)
@@ -226,9 +226,9 @@ fn remaining_script_expands_170_runs_and_the_six_required_skips() {
 
     let stdout = String::from_utf8(output.stdout).unwrap();
     let lines = stdout.lines().collect::<Vec<_>>();
-    assert_eq!(lines.len(), 177);
+    assert_eq!(lines.len(), 565);
     let expected_final = format!(
-        "dry-run listed 170 executable RunUnits and 6 explicit skips: {}",
+        "dry-run listed 558 executable RunUnits in 186 combinations and 6 unsupported combinations (18 omitted repetitions): {}",
         output_root.display()
     );
     assert_eq!(lines.last().copied(), Some(expected_final.as_str()));
@@ -243,41 +243,54 @@ fn remaining_script_expands_170_runs_and_the_six_required_skips() {
         .copied()
         .filter(|line| line.starts_with("[skip unsupported"))
         .collect::<Vec<_>>();
-    assert_eq!(run_lines.len(), 170);
+    assert_eq!(run_lines.len(), 558);
     assert_eq!(skip_lines.len(), 6);
 
     for backend in ["rustkv", "leveldb"] {
-        for workload in ["random_get", "range_scan", "single_delete", "batch_delete"] {
+        for workload in [
+            "random_get",
+            "range_scan",
+            "single_put",
+            "batch_put",
+            "single_delete",
+            "batch_delete",
+        ] {
             for (records, scale) in [
                 ("10000", "1w"),
                 ("100000", "10w"),
                 ("1000000", "100w"),
                 ("10000000", "1000w"),
             ] {
-                let expected = format!(
-                    " {backend} {workload} records={records} threads=1 output={}/{}_{}_{}_t1",
-                    output_root.display(),
-                    backend,
-                    workload,
-                    scale
-                );
+                let expected =
+                    format!(" {backend} {workload} records={records} threads=1 repetition=");
                 assert_eq!(
                     run_lines
                         .iter()
                         .filter(|line| line.contains(&expected))
                         .count(),
-                    1,
+                    3,
                     "missing or duplicate dry-run entry: {expected}"
                 );
+                for repetition in 1..=3 {
+                    let output = format!(
+                        "repetition={repetition} output={}/{}_{}_{}_t1/repetition_{repetition}",
+                        output_root.display(),
+                        backend,
+                        workload,
+                        scale
+                    );
+                    assert_eq!(
+                        run_lines
+                            .iter()
+                            .filter(|line| line.contains(&expected) && line.contains(&output))
+                            .count(),
+                        1,
+                        "missing or duplicate repetition: {output}"
+                    );
+                }
             }
         }
     }
-    assert!(
-        run_lines
-            .iter()
-            .filter(|line| line.contains("threads=1 output="))
-            .all(|line| !line.contains("single_put") && !line.contains("batch_put"))
-    );
 
     for backend in ["rustkv", "leveldb"] {
         for workload in [
@@ -299,19 +312,14 @@ fn remaining_script_expands_170_runs_and_the_six_required_skips() {
                         && threads == "1000"
                         && matches!(workload, "range_scan" | "batch_put" | "batch_delete");
                     let expected = format!(
-                        " {backend} {workload} records={records} threads={threads} output={}/{}_{}_{}_t{}",
-                        output_root.display(),
-                        backend,
-                        workload,
-                        scale,
-                        threads
+                        " {backend} {workload} records={records} threads={threads} repetition="
                     );
                     assert_eq!(
                         run_lines
                             .iter()
                             .filter(|line| line.contains(&expected))
                             .count(),
-                        usize::from(!unsupported),
+                        if unsupported { 0 } else { 3 },
                         "unexpected executable count: {expected}"
                     );
                     if unsupported {
@@ -326,6 +334,27 @@ fn remaining_script_expands_170_runs_and_the_six_required_skips() {
                             1,
                             "missing or duplicate skip: {expected_skip}"
                         );
+                    } else {
+                        for repetition in 1..=3 {
+                            let output = format!(
+                                "repetition={repetition} output={}/{}_{}_{}_t{}/repetition_{repetition}",
+                                output_root.display(),
+                                backend,
+                                workload,
+                                scale,
+                                threads
+                            );
+                            assert_eq!(
+                                run_lines
+                                    .iter()
+                                    .filter(|line| {
+                                        line.contains(&expected) && line.contains(&output)
+                                    })
+                                    .count(),
+                                1,
+                                "missing or duplicate repetition: {output}"
+                            );
+                        }
                     }
                 }
             }
@@ -339,10 +368,13 @@ fn remaining_script_expands_170_runs_and_the_six_required_skips() {
         .unwrap();
     assert!(help.status.success());
     let help = String::from_utf8(help.stdout).unwrap();
-    assert!(help.contains("random_get, range_scan, single_delete, batch_delete"));
+    assert!(
+        help.contains("random_get, range_scan, single_put, batch_put, single_delete, batch_delete")
+    );
     assert!(help.contains("10000 (1w)"));
     assert!(help.contains("10000000 (1000w)"));
-    assert!(help.contains("executes 170 valid RunUnits"));
+    assert!(help.contains("repetitions: 3 per valid combination"));
+    assert!(help.contains("executes 558 RunUnits"));
     assert!(
         !Command::new("sh")
             .arg(&script)
@@ -355,21 +387,38 @@ fn remaining_script_expands_170_runs_and_the_six_required_skips() {
 }
 
 #[test]
-fn remaining_script_skips_only_complete_matching_results() {
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/run_remaining_t1.sh");
-    let temp = TempDirectory::new("remaining-resume");
+fn all_workload_script_skips_only_complete_matching_results() {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/run_all_workload.sh");
+    let temp = TempDirectory::new("all-workload-resume");
     let output_root = temp.path().join("output");
     std::fs::create_dir(&output_root).unwrap();
 
     for backend in ["leveldb", "rustkv"] {
-        for workload in ["random_get", "range_scan", "single_delete", "batch_delete"] {
+        for workload in [
+            "random_get",
+            "range_scan",
+            "single_put",
+            "batch_put",
+            "single_delete",
+            "batch_delete",
+        ] {
             for (records, scale) in [
                 ("10000", "1w"),
                 ("100000", "10w"),
                 ("1000000", "100w"),
                 ("10000000", "1000w"),
             ] {
-                write_complete_script_result(&output_root, backend, workload, records, scale, "1");
+                for repetition in ["1", "2", "3"] {
+                    write_complete_script_result(
+                        &output_root,
+                        backend,
+                        workload,
+                        records,
+                        scale,
+                        "1",
+                        repetition,
+                    );
+                }
             }
         }
     }
@@ -395,14 +444,17 @@ fn remaining_script_skips_only_complete_matching_results() {
                     {
                         continue;
                     }
-                    write_complete_script_result(
-                        &output_root,
-                        backend,
-                        workload,
-                        records,
-                        scale,
-                        threads,
-                    );
+                    for repetition in ["1", "2", "3"] {
+                        write_complete_script_result(
+                            &output_root,
+                            backend,
+                            workload,
+                            records,
+                            scale,
+                            threads,
+                            repetition,
+                        );
+                    }
                 }
             }
         }
@@ -416,9 +468,11 @@ fn remaining_script_skips_only_complete_matching_results() {
         .unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert_eq!(stdout.matches("skip completed").count(), 170);
+    assert_eq!(stdout.matches("skip completed").count(), 558);
     assert_eq!(stdout.matches("skip unsupported").count(), 6);
-    assert!(stdout.contains("all 170 executable custom benchmarks completed; skipped=6"));
+    assert!(stdout.contains(
+        "all 558 executable custom benchmarks completed in 186 combinations; skipped combinations=6; omitted repetitions=18"
+    ));
 
     let incomplete_root = temp.path().join("incomplete");
     std::fs::create_dir_all(incomplete_root.join("leveldb_random_get_1w_t1")).unwrap();
@@ -434,6 +488,27 @@ fn remaining_script_skips_only_complete_matching_results() {
             .unwrap()
             .contains("incomplete or mismatched")
     );
+
+    let incomplete_repetition_root = temp.path().join("incomplete-repetition");
+    let combination = incomplete_repetition_root.join("leveldb_random_get_1w_t1");
+    std::fs::create_dir_all(combination.join("repetition_1")).unwrap();
+    std::fs::write(
+        combination.join("combination.txt"),
+        "mode=custom-repetitions\nrecord_count=10000\nbackend=leveldb\nworkload=random_get\nthreads=1\nrepetitions=3\n",
+    )
+    .unwrap();
+    let output = Command::new("sh")
+        .arg(&script)
+        .arg("--output-root")
+        .arg(&incomplete_repetition_root)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("repetition output is incomplete or mismatched")
+    );
 }
 
 fn write_complete_script_result(
@@ -443,8 +518,18 @@ fn write_complete_script_result(
     records: &str,
     scale: &str,
     threads: &str,
+    repetition: &str,
 ) {
-    let result = output_root.join(format!("{backend}_{workload}_{scale}_t{threads}"));
+    let combination = output_root.join(format!("{backend}_{workload}_{scale}_t{threads}"));
+    std::fs::create_dir_all(&combination).unwrap();
+    std::fs::write(
+        combination.join("combination.txt"),
+        format!(
+            "mode=custom-repetitions\nrecord_count={records}\nbackend={backend}\nworkload={workload}\nthreads={threads}\nrepetitions=3\n"
+        ),
+    )
+    .unwrap();
+    let result = combination.join(format!("repetition_{repetition}"));
     std::fs::create_dir(&result).unwrap();
     std::fs::write(
         result.join("parameters.txt"),
