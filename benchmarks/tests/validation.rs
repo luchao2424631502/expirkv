@@ -1,12 +1,13 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Barrier, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use kv_bench::{
     BackendKind, BackendResult, BatchItem, BenchBackend, BenchConfig, BenchmarkWorkspace,
     GetResult, ScanRequest, ScanResult, ScanValidation, TemplateErrorKind, Trace, ValidationError,
     Workload, build_test_template, encode_key, fixed_value, prepare_run, prewarm_full_dataset,
-    validate_empty_dataset, validate_full_dataset,
+    validate_empty_dataset, validate_final_dataset, validate_full_dataset,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -20,6 +21,62 @@ fn prewarm_is_one_complete_untimed_full_iterator_call() {
     assert_eq!(summary.record_count, 1_000);
     assert_eq!(summary.value_bytes, 1_000 * 1_024);
     assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn final_full_validation_uses_parallel_partitions_with_boundary_overlap() {
+    let config = test_config();
+    let worker_count = std::thread::available_parallelism()
+        .map_or(1, |parallelism| parallelism.get())
+        .min(config.record_count() as usize);
+    let backend = ParallelFullScan::new(config.clone(), worker_count);
+
+    let summary = validate_final_dataset(&backend, &config, Workload::RandomGet).unwrap();
+    assert_eq!(summary.record_count, 1_000);
+    assert_eq!(summary.value_bytes, 1_000 * 1_024);
+    assert_eq!(backend.calls.load(Ordering::SeqCst), worker_count);
+    assert_eq!(backend.max_active.load(Ordering::SeqCst), worker_count);
+
+    let mut observations = backend.observations.lock().unwrap();
+    observations.sort_by_key(|observation| observation.expected_ids[0]);
+    assert_eq!(observations.len(), worker_count);
+    let worker_count_u64 = worker_count as u64;
+    let records_per_worker = config.record_count() / worker_count_u64;
+    let remainder = config.record_count() % worker_count_u64;
+    for (worker_index, observation) in observations.iter().enumerate() {
+        let worker_index = worker_index as u64;
+        let own_start = worker_index * records_per_worker + worker_index.min(remainder);
+        let own_length = records_per_worker + u64::from(worker_index < remainder);
+        let own_end = own_start + own_length;
+        let validation_end = if own_end < config.record_count() {
+            own_end + 1
+        } else {
+            own_end
+        };
+        assert_eq!(
+            observation.expected_ids,
+            (own_start..validation_end).collect::<Vec<_>>()
+        );
+        let expected_start = if own_start == 0 {
+            Vec::new()
+        } else {
+            encode_key(&config, own_start).unwrap().to_vec()
+        };
+        assert_eq!(observation.start, expected_start);
+        assert_eq!(
+            observation.limit,
+            observation.expected_ids.len() + usize::from(own_end == config.record_count())
+        );
+    }
+}
+
+#[test]
+fn final_full_validation_converts_a_worker_panic_into_validation_failure() {
+    let config = test_config();
+    assert_eq!(
+        validate_final_dataset(&PanickingFinalScan, &config, Workload::RandomGet),
+        Err(ValidationError::WorkerPanicked { worker_index: 0 })
+    );
 }
 
 #[test]
@@ -176,9 +233,19 @@ fn both_backends_reject_missing_extra_wrong_key_wrong_value_and_residual_delete(
                 ValidationFault::Missing => {
                     opened.delete_for_test(&encode_key(&config, 999).unwrap())?;
                 }
+                ValidationFault::MissingBoundary => {
+                    let boundary = first_final_validation_boundary(&config);
+                    opened.delete_for_test(&encode_key(&config, boundary).unwrap())?;
+                }
                 ValidationFault::Extra => {
                     let mut extra_key = [0_u8; 16];
                     extra_key[8..].copy_from_slice(&1_000_u64.to_be_bytes());
+                    opened.put_for_test(&extra_key, &value)?;
+                }
+                ValidationFault::InteriorExtra => {
+                    let boundary = first_final_validation_boundary(&config);
+                    let mut extra_key = encode_key(&config, boundary - 1).unwrap().to_vec();
+                    extra_key.push(0);
                     opened.put_for_test(&extra_key, &value)?;
                 }
                 ValidationFault::WrongKey => {
@@ -339,16 +406,20 @@ fn both_backends_refuse_to_recreate_a_missing_delete_database_during_validation(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ValidationFault {
     Missing,
+    MissingBoundary,
     Extra,
+    InteriorExtra,
     WrongKey,
     WrongValue,
     ResidualDelete,
 }
 
 impl ValidationFault {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 7] = [
         Self::Missing,
+        Self::MissingBoundary,
         Self::Extra,
+        Self::InteriorExtra,
         Self::WrongKey,
         Self::WrongValue,
         Self::ResidualDelete,
@@ -357,11 +428,137 @@ impl ValidationFault {
     const fn label(self) -> &'static str {
         match self {
             Self::Missing => "missing",
+            Self::MissingBoundary => "missing-boundary",
             Self::Extra => "extra",
+            Self::InteriorExtra => "interior-extra",
             Self::WrongKey => "wrong-key",
             Self::WrongValue => "wrong-value",
             Self::ResidualDelete => "residual-delete",
         }
+    }
+}
+
+fn first_final_validation_boundary(config: &BenchConfig) -> u64 {
+    let worker_count = std::thread::available_parallelism()
+        .map_or(1, |parallelism| parallelism.get())
+        .min(config.record_count() as usize) as u64;
+    let first_length = config.record_count() / worker_count
+        + u64::from(!config.record_count().is_multiple_of(worker_count));
+    first_length.min(config.record_count() - 1).max(1)
+}
+
+#[derive(Debug)]
+struct ScanObservation {
+    start: Vec<u8>,
+    limit: usize,
+    expected_ids: Vec<u64>,
+}
+
+struct ParallelFullScan {
+    config: BenchConfig,
+    barrier: Barrier,
+    calls: AtomicUsize,
+    active: AtomicUsize,
+    max_active: AtomicUsize,
+    observations: Mutex<Vec<ScanObservation>>,
+}
+
+impl ParallelFullScan {
+    fn new(config: BenchConfig, worker_count: usize) -> Self {
+        Self {
+            config,
+            barrier: Barrier::new(worker_count),
+            calls: AtomicUsize::new(0),
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+            observations: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl BenchBackend for ParallelFullScan {
+    fn get(&self, _key: &[u8]) -> BackendResult<GetResult> {
+        panic!("final validation must not call get")
+    }
+
+    fn put(&self, _key: &[u8], _value: &[u8]) -> BackendResult<()> {
+        panic!("final validation must not call put")
+    }
+
+    fn delete(&self, _key: &[u8]) -> BackendResult<()> {
+        panic!("final validation must not call delete")
+    }
+
+    fn write_batch(&self, _items: &[BatchItem<'_>]) -> BackendResult<()> {
+        panic!("final validation must not call write_batch")
+    }
+
+    fn iterator_scan(&self, request: ScanRequest<'_>) -> BackendResult<ScanResult> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_active.fetch_max(active, Ordering::SeqCst);
+        self.barrier.wait();
+
+        let expected = match request.validation {
+            ScanValidation::Full { expected } => expected,
+            ScanValidation::Timed { .. } => {
+                panic!("final validation must use full validation mode")
+            }
+        };
+        let value = fixed_value(&self.config);
+        let expected_ids = expected
+            .iter()
+            .map(|record| {
+                assert_eq!(record.value, value);
+                u64::from_be_bytes(record.key[8..].try_into().unwrap())
+            })
+            .collect::<Vec<_>>();
+        self.observations.lock().unwrap().push(ScanObservation {
+            start: request.start.to_vec(),
+            limit: request.limit,
+            expected_ids,
+        });
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        Ok(ScanResult {
+            record_count: expected.len(),
+            value_bytes: expected.len() * value.len(),
+        })
+    }
+}
+
+struct PanickingFinalScan;
+
+impl BenchBackend for PanickingFinalScan {
+    fn get(&self, _key: &[u8]) -> BackendResult<GetResult> {
+        panic!("final validation must not call get")
+    }
+
+    fn put(&self, _key: &[u8], _value: &[u8]) -> BackendResult<()> {
+        panic!("final validation must not call put")
+    }
+
+    fn delete(&self, _key: &[u8]) -> BackendResult<()> {
+        panic!("final validation must not call delete")
+    }
+
+    fn write_batch(&self, _items: &[BatchItem<'_>]) -> BackendResult<()> {
+        panic!("final validation must not call write_batch")
+    }
+
+    fn iterator_scan(&self, request: ScanRequest<'_>) -> BackendResult<ScanResult> {
+        if request.start.is_empty() {
+            panic!("injected final-validation worker panic")
+        }
+        let expected = match request.validation {
+            ScanValidation::Full { expected } => expected,
+            ScanValidation::Timed { .. } => {
+                panic!("final validation must use full validation mode")
+            }
+        };
+        Ok(ScanResult {
+            record_count: expected.len(),
+            value_bytes: expected.len() * 1_024,
+        })
     }
 }
 

@@ -9,7 +9,7 @@
 ## 2. 规范、目录与版本
 
 - 唯一性能执行规范：`/Users/Admin/work/kv/benchmark_plan.md`
-- Benchmark 方案 SHA-256：`b98a2f8b5a0b3e42311a1f81f874364de5a51738c826ebcd9cd38e28ca2ca5cd`
+- Benchmark 方案 SHA-256：`49f1455aca9b92b3c3d91a1b617cd04b25a6ed6b9baf5ee636022969a1305aec`
 - RustKV 语义规范：`/Users/Admin/work/kv/系统设计文档_v2.md`
 - 系统设计 SHA-256：`e5cbc3517f20874bd83bb13bd694b9f4ee74b37863f16fd6927dea22287ea21e`
 - 需求背景：`/Users/Admin/work/kv/需求分析文档_v2.md`
@@ -59,6 +59,7 @@ B0～B7均在当前 Mac 上执行。B7生成的结论只代表文档记录的当
 13. 任何测试结果出来后先停止并等待用户 Review；不得自动提交。
 14. 最终 Benchmark 的每个 RunUnit 必须使用独立新目录并直接执行 Load→关闭→重开初始验证→关闭→独立打开 Run；禁止调用 B5 模板恢复、密封模板、APFS COW 克隆或物理复制能力生成正式初始状态。
 15. B5 已实现的模板能力只作为历史代码保留；后续代码可以复用其计时外全量验证语义，但不得把模板生成、复制、恢复、发布或密封重新接入 B6/B7。
+16. 经用户批准，计时结束并关闭重开后的终态满库验证按机器可用并行度划分连续 Key 区间并行执行；初始验证和读取预热保持原有单线程完整顺序 Iterator。该优化不得改变 Load→Run 实验条件、正式线程、Trace、Barrier、计时和统计语义。
 
 ## 5. 工程与Git边界
 
