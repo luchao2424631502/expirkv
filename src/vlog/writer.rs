@@ -496,6 +496,25 @@ impl ValueLogWriter {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn open_with_io(
+        directory: Arc<VLogDirectory>,
+        database_uuid: [u8; 16],
+        geometry: VLogGeometry,
+        catalog: Arc<FileCatalog>,
+        accepted_end: Option<VLogPosition>,
+        io: Arc<dyn WriterIo>,
+    ) -> Result<Self> {
+        Self::open_inner(
+            directory,
+            database_uuid,
+            geometry,
+            catalog,
+            accepted_end,
+            io,
+        )
+    }
+
     fn open_inner(
         directory: Arc<VLogDirectory>,
         database_uuid: [u8; 16],

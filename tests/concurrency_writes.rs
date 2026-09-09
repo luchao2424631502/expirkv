@@ -1,6 +1,8 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
+use std::{fs, path::Path};
 
 use rustkv::{Db, Options, ReadOptions, WriteBatch, WriteOptions};
 use tempfile::TempDir;
@@ -15,6 +17,20 @@ struct FirstBatchWindow {
     thread_id: usize,
     started: Instant,
     returned: Instant,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MixedOperationWindow {
+    kind: &'static str,
+    started: Instant,
+    returned: Instant,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FrontierObservation {
+    head: u64,
+    durable: u64,
+    end: Option<(u32, u64)>,
 }
 
 fn create_options() -> Options {
@@ -279,5 +295,436 @@ fn non_overlapping_same_key_writes_preserve_real_time_order() -> TestResult {
     let stats = db.stats();
     assert_eq!(stats.head_seq, 2);
     assert_eq!(stats.durable_seq, 2);
+    Ok(())
+}
+
+fn vlog_inventory(
+    root: &Path,
+) -> std::result::Result<Vec<(String, u64)>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(root.join("vlog"))? {
+        let entry = entry?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| "non-UTF8 VLog file name")?;
+        files.push((name, entry.metadata()?.len()));
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn persisted_frontier(
+    root: &Path,
+) -> std::result::Result<(u64, u64, Option<(u32, u64)>), Box<dyn std::error::Error + Send + Sync>> {
+    let database = fjall::Database::builder(root.join("index"))
+        .manual_journal_persist(true)
+        .open()?;
+    let system = database.keyspace(
+        "rustkv_system_metadata",
+        fjall::KeyspaceCreateOptions::default,
+    )?;
+    let encoded = system
+        .get(b"durable_frontier")?
+        .ok_or_else(|| "durable frontier is missing")?
+        .to_vec();
+    if encoded.len() != 39
+        || encoded.get(0..4) != Some(b"RKDF".as_slice())
+        || u16::from_le_bytes(encoded[4..6].try_into()?) != 0
+        || crc32c::crc32c(&encoded[..35]) != u32::from_le_bytes(encoded[35..39].try_into()?)
+    {
+        return Err("malformed durable frontier".into());
+    }
+    let durable = u64::from_le_bytes(encoded[6..14].try_into()?);
+    let vlog_seq = u64::from_le_bytes(encoded[14..22].try_into()?);
+    let file_id = u32::from_le_bytes(encoded[23..27].try_into()?);
+    let offset = u64::from_le_bytes(encoded[27..35].try_into()?);
+    let end = match encoded[22] {
+        0 if file_id == 0 && offset == 0 => None,
+        1 => Some((file_id, offset)),
+        _ => return Err("invalid durable VLog end".into()),
+    };
+    Ok((durable, vlog_seq, end))
+}
+
+#[test]
+fn concurrent_put_delete_batches_and_barriers_preserve_frontiers_without_delete_vlog_growth()
+-> TestResult {
+    const SEEDS: usize = 16;
+    const PUTS: usize = 24;
+    const SINGLE_DELETES: usize = 24;
+    const DELETE_BATCHES: usize = 12;
+    const SYNC_DELETES: usize = 12;
+    const EMPTY_BARRIERS: usize = 12;
+
+    let folder = TempDir::new()?;
+    let mixed_root = folder.path().join("mixed");
+    let control_root = folder.path().join("put-only-control");
+    let mixed = Arc::new(Db::open(&create_options(), &mixed_root)?);
+    let control = Db::open(&create_options(), &control_root)?;
+    let value = [0x5a_u8; 32];
+
+    // The control database receives the same number of Put transactions with
+    // the same key/value lengths. Fixed-width envelope metadata therefore
+    // makes it an exact physical-length control even though commit_seq/UUID
+    // bytes differ from the interleaved database.
+    for seed in 0..SEEDS {
+        let key = format!("seed-{seed:04}");
+        mixed.put(&WriteOptions::default(), key.as_bytes(), &value)?;
+        control.put(&WriteOptions::default(), key.as_bytes(), &value)?;
+    }
+    for item in 0..DELETE_BATCHES {
+        for side in ["left", "right"] {
+            let key = format!("batch-{item:04}-{side}");
+            mixed.put(&WriteOptions::default(), key.as_bytes(), &value)?;
+            control.put(&WriteOptions::default(), key.as_bytes(), &value)?;
+        }
+    }
+    for item in 0..PUTS {
+        let key = format!("put-{item:04}");
+        control.put(&WriteOptions::default(), key.as_bytes(), &value)?;
+    }
+    control.write(&WriteOptions { sync: true }, &WriteBatch::new())?;
+
+    let start = Arc::new(std::sync::Barrier::new(5));
+    let first_calls = Arc::new(std::sync::Barrier::new(4));
+    let windows = Arc::new(Mutex::new(Vec::<MixedOperationWindow>::new()));
+    let frontier_observations = Arc::new(Mutex::new(Vec::<FrontierObservation>::new()));
+    let batch_reader_ready = Arc::new(AtomicBool::new(false));
+    let batch_done = Arc::new(AtomicBool::new(false));
+    let (sender, receiver) = mpsc::channel();
+    let mut handles = Vec::new();
+
+    {
+        let db = Arc::clone(&mixed);
+        let start = Arc::clone(&start);
+        let first_calls = Arc::clone(&first_calls);
+        let windows = Arc::clone(&windows);
+        let sender = sender.clone();
+        handles.push(thread::spawn(move || {
+            start.wait();
+            let result = (|| -> WorkerResult {
+                let first_started = Instant::now();
+                first_calls.wait();
+                for item in 0..PUTS {
+                    let key = format!("put-{item:04}");
+                    db.put(&WriteOptions::default(), key.as_bytes(), &[0x5a; 32])
+                        .map_err(|error| format!("put {item} failed: {error:?}"))?;
+                    if item == 0 {
+                        windows
+                            .lock()
+                            .map_err(|_| "operation-window mutex poisoned".to_owned())?
+                            .push(MixedOperationWindow {
+                                kind: "put",
+                                started: first_started,
+                                returned: Instant::now(),
+                            });
+                    }
+                    thread::yield_now();
+                }
+                Ok(())
+            })();
+            let _ = sender.send(result);
+        }));
+    }
+    {
+        let db = Arc::clone(&mixed);
+        let start = Arc::clone(&start);
+        let first_calls = Arc::clone(&first_calls);
+        let windows = Arc::clone(&windows);
+        let sender = sender.clone();
+        handles.push(thread::spawn(move || {
+            start.wait();
+            let result = (|| -> WorkerResult {
+                let first_started = Instant::now();
+                first_calls.wait();
+                for item in 0..SINGLE_DELETES {
+                    let key = format!("seed-{:04}", item % SEEDS);
+                    db.delete(&WriteOptions::default(), key.as_bytes())
+                        .map_err(|error| format!("delete {item} failed: {error:?}"))?;
+                    if item == 0 {
+                        windows
+                            .lock()
+                            .map_err(|_| "operation-window mutex poisoned".to_owned())?
+                            .push(MixedOperationWindow {
+                                kind: "delete",
+                                started: first_started,
+                                returned: Instant::now(),
+                            });
+                    }
+                    thread::yield_now();
+                }
+                Ok(())
+            })();
+            let _ = sender.send(result);
+        }));
+    }
+    {
+        let db = Arc::clone(&mixed);
+        let start = Arc::clone(&start);
+        let first_calls = Arc::clone(&first_calls);
+        let windows = Arc::clone(&windows);
+        let reader_ready = Arc::clone(&batch_reader_ready);
+        let done = Arc::clone(&batch_done);
+        let sender = sender.clone();
+        handles.push(thread::spawn(move || {
+            start.wait();
+            let result = (|| -> WorkerResult {
+                let ready_deadline = Instant::now() + TIMEOUT;
+                while !reader_ready.load(Ordering::Acquire) {
+                    if Instant::now() >= ready_deadline {
+                        return Err("batch reader did not become ready".to_owned());
+                    }
+                    thread::yield_now();
+                }
+                let first_started = Instant::now();
+                first_calls.wait();
+                for item in 0..DELETE_BATCHES {
+                    let mut batch = WriteBatch::new();
+                    batch
+                        .delete(format!("batch-{item:04}-left").as_bytes())
+                        .map_err(|error| format!("batch delete construction: {error:?}"))?;
+                    batch
+                        .delete(format!("batch-{item:04}-right").as_bytes())
+                        .map_err(|error| format!("batch delete construction: {error:?}"))?;
+                    db.write(&WriteOptions::default(), &batch)
+                        .map_err(|error| format!("delete batch {item} failed: {error:?}"))?;
+                    if item == 0 {
+                        windows
+                            .lock()
+                            .map_err(|_| "operation-window mutex poisoned".to_owned())?
+                            .push(MixedOperationWindow {
+                                kind: "delete-batch",
+                                started: first_started,
+                                returned: Instant::now(),
+                            });
+                    }
+                    thread::yield_now();
+                }
+                Ok(())
+            })();
+            done.store(true, Ordering::Release);
+            let _ = sender.send(result);
+        }));
+    }
+    {
+        let db = Arc::clone(&mixed);
+        let start = Arc::clone(&start);
+        let first_calls = Arc::clone(&first_calls);
+        let windows = Arc::clone(&windows);
+        let observations = Arc::clone(&frontier_observations);
+        let sender = sender.clone();
+        handles.push(thread::spawn(move || {
+            start.wait();
+            let result = (|| -> WorkerResult {
+                let first_started = Instant::now();
+                first_calls.wait();
+                for item in 0..SYNC_DELETES {
+                    let key = format!("seed-{:04}", (item + 4) % SEEDS);
+                    db.delete(&WriteOptions { sync: true }, key.as_bytes())
+                        .map_err(|error| format!("sync delete {item} failed: {error:?}"))?;
+                    let after_delete = db.stats();
+                    observations
+                        .lock()
+                        .map_err(|_| "frontier-observation mutex poisoned".to_owned())?
+                        .push(FrontierObservation {
+                            head: after_delete.head_seq,
+                            durable: after_delete.durable_seq,
+                            end: after_delete
+                                .durable_vlog_end
+                                .map(|end| (end.file_id, end.offset)),
+                        });
+                    db.write(&WriteOptions { sync: true }, &WriteBatch::new())
+                        .map_err(|error| format!("empty barrier {item} failed: {error:?}"))?;
+                    let after_empty = db.stats();
+                    observations
+                        .lock()
+                        .map_err(|_| "frontier-observation mutex poisoned".to_owned())?
+                        .push(FrontierObservation {
+                            head: after_empty.head_seq,
+                            durable: after_empty.durable_seq,
+                            end: after_empty
+                                .durable_vlog_end
+                                .map(|end| (end.file_id, end.offset)),
+                        });
+                    if item == 0 {
+                        windows
+                            .lock()
+                            .map_err(|_| "operation-window mutex poisoned".to_owned())?
+                            .push(MixedOperationWindow {
+                                kind: "sync-delete-and-empty-barrier",
+                                started: first_started,
+                                returned: Instant::now(),
+                            });
+                    }
+                    thread::yield_now();
+                }
+                Ok(())
+            })();
+            let _ = sender.send(result);
+        }));
+    }
+    {
+        let db = Arc::clone(&mixed);
+        let start = Arc::clone(&start);
+        let ready = Arc::clone(&batch_reader_ready);
+        let done = Arc::clone(&batch_done);
+        let sender = sender.clone();
+        handles.push(thread::spawn(move || {
+            start.wait();
+            ready.store(true, Ordering::Release);
+            let result = (|| -> WorkerResult {
+                let mut checks = 0_usize;
+                while checks < 8 || !done.load(Ordering::Acquire) {
+                    let snapshot = db
+                        .snapshot()
+                        .map_err(|error| format!("batch observer snapshot failed: {error:?}"))?;
+                    let options = ReadOptions {
+                        snapshot: Some(&snapshot),
+                    };
+                    for item in 0..DELETE_BATCHES {
+                        let left_key = format!("batch-{item:04}-left");
+                        let right_key = format!("batch-{item:04}-right");
+                        let left = db
+                            .get(&options, left_key.as_bytes())
+                            .map_err(|error| format!("batch left read failed: {error:?}"))?;
+                        let right = db
+                            .get(&options, right_key.as_bytes())
+                            .map_err(|error| format!("batch right read failed: {error:?}"))?;
+                        if left.is_some() != right.is_some() {
+                            return Err(format!(
+                                "partial pure-Delete Batch observed for item {item}"
+                            ));
+                        }
+                        if left.as_deref().is_some_and(|bytes| bytes != [0x5a; 32])
+                            || right.as_deref().is_some_and(|bytes| bytes != [0x5a; 32])
+                        {
+                            return Err(format!("unexpected batch value for item {item}"));
+                        }
+                    }
+                    checks += 1;
+                    thread::yield_now();
+                }
+                Ok(())
+            })();
+            let _ = sender.send(result);
+        }));
+    }
+    drop(sender);
+
+    receive_all("mixed-index-only-concurrency", 5, &receiver)?;
+    for handle in handles {
+        handle.join().map_err(|_| "mixed writer panicked")?;
+    }
+    let windows = windows
+        .lock()
+        .map_err(|_| "operation-window mutex poisoned")?;
+    assert_eq!(windows.len(), 4);
+    for expected in [
+        "put",
+        "delete",
+        "delete-batch",
+        "sync-delete-and-empty-barrier",
+    ] {
+        assert!(windows.iter().any(|window| window.kind == expected));
+    }
+    let latest_start = windows
+        .iter()
+        .map(|window| window.started)
+        .max()
+        .expect("four operation windows");
+    let earliest_return = windows
+        .iter()
+        .map(|window| window.returned)
+        .min()
+        .expect("four operation windows");
+    assert!(
+        latest_start <= earliest_return,
+        "first operation windows did not overlap"
+    );
+    drop(windows);
+
+    let observations = frontier_observations
+        .lock()
+        .map_err(|_| "frontier-observation mutex poisoned")?;
+    assert_eq!(observations.len(), SYNC_DELETES * 2);
+    for observation in observations.iter() {
+        assert!(observation.durable <= observation.head);
+        assert!(observation.end.is_some());
+    }
+    for pair in observations.windows(2) {
+        assert!(pair[0].head <= pair[1].head);
+        assert!(pair[0].durable <= pair[1].durable);
+        assert!(pair[0].end <= pair[1].end);
+    }
+    drop(observations);
+
+    let concurrent_transactions =
+        (SEEDS + (2 * DELETE_BATCHES) + PUTS + SINGLE_DELETES + DELETE_BATCHES + SYNC_DELETES)
+            as u64;
+    assert_eq!(mixed.stats().head_seq, concurrent_transactions);
+    let tail_put_seq = concurrent_transactions + 1;
+    mixed.put(&WriteOptions::default(), b"tail-put", &value)?;
+    control.put(&WriteOptions::default(), b"tail-put", &value)?;
+    mixed.delete(&WriteOptions { sync: true }, b"tail-delete-missing")?;
+    control.write(&WriteOptions { sync: true }, &WriteBatch::new())?;
+    mixed.write(&WriteOptions { sync: true }, &WriteBatch::new())?;
+
+    let expected_transactions = tail_put_seq + 1;
+    let stats = mixed.stats();
+    assert_eq!(
+        (stats.head_seq, stats.durable_seq),
+        (expected_transactions, expected_transactions)
+    );
+    assert_eq!(stats.durability_lag, 0);
+    let public_end = stats
+        .durable_vlog_end
+        .as_ref()
+        .map(|end| (end.file_id, end.offset));
+    assert_eq!(
+        vlog_inventory(&mixed_root)?,
+        vlog_inventory(&control_root)?,
+        "IndexOnlyDelete and both barrier forms must not add VLog bytes"
+    );
+
+    for seed in 0..SEEDS {
+        let key = format!("seed-{seed:04}");
+        assert_eq!(mixed.get(&ReadOptions::default(), key.as_bytes())?, None);
+    }
+    for item in 0..PUTS {
+        let key = format!("put-{item:04}");
+        assert_eq!(
+            mixed
+                .get(&ReadOptions::default(), key.as_bytes())?
+                .as_deref(),
+            Some(value.as_slice())
+        );
+    }
+    for item in 0..DELETE_BATCHES {
+        for side in ["left", "right"] {
+            let key = format!("batch-{item:04}-{side}");
+            assert_eq!(mixed.get(&ReadOptions::default(), key.as_bytes())?, None);
+        }
+    }
+    assert_eq!(
+        mixed.get(&ReadOptions::default(), b"tail-put")?.as_deref(),
+        Some(value.as_slice())
+    );
+    assert_eq!(EMPTY_BARRIERS, SYNC_DELETES);
+
+    drop(mixed);
+    drop(control);
+    let (durable, durable_vlog_seq, durable_end) = persisted_frontier(&mixed_root)?;
+    assert_eq!(durable, expected_transactions);
+    assert_eq!(durable_vlog_seq, tail_put_seq);
+    assert_eq!(durable_end, public_end);
+    let physical = vlog_inventory(&mixed_root)?;
+    let (last_name, last_len) = physical.last().expect("VLog contains Put envelopes");
+    let last_file_id = last_name
+        .strip_prefix('D')
+        .and_then(|name| name.strip_suffix(".data"))
+        .ok_or("malformed VLog file name")?
+        .parse::<u32>()?;
+    assert_eq!(durable_end, Some((last_file_id, *last_len)));
     Ok(())
 }
