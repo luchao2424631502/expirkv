@@ -148,6 +148,39 @@ pub(crate) struct TransactionDescriptor {
     pub(crate) mutations: Vec<TxMutation>,
 }
 
+#[cfg(test)]
+impl TransactionDescriptor {
+    pub(crate) fn encode_index_only_delete_for_test(
+        commit_seq: CommitSeq,
+        tx_uuid: [u8; 16],
+        logical_op_count: u64,
+        mutations: Vec<TxMutation>,
+    ) -> Result<EncodedDescriptor> {
+        let distinct_key_count = u64::try_from(mutations.len()).map_err(|_| encode_capacity())?;
+        encode_descriptor(&Self {
+            meta: TxMeta {
+                transaction_kind: TransactionKind::IndexOnlyDelete,
+                commit_seq,
+                tx_uuid: TxUuid(tx_uuid),
+                prev_seq: commit_seq.checked_sub(1).ok_or_else(encode_invalid)?,
+                vlog_begin: VLogPos {
+                    file_id: 0,
+                    offset: 0,
+                },
+                vlog_end: VLogPos {
+                    file_id: 0,
+                    offset: 0,
+                },
+                logical_op_count,
+                distinct_key_count,
+                envelope_crc32c: 0,
+                descriptor_crc32c: 0,
+            },
+            mutations,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct EncodedMutation {
     pub(crate) key: [u8; TX_MUTATION_KEY_ENCODED_LEN],

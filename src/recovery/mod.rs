@@ -3,8 +3,8 @@
 
 use crate::commit::{
     DurableFrontier, DurableVLogEnd, RECOVERY_STATE_KEY, RecoveryPhase, RecoveryState,
-    TransactionDescriptor, VLogPos, ValueState, decode_descriptor, decode_head_seq,
-    decode_tx_meta_key, decode_tx_mutation_key, encode_tx_meta_key,
+    TransactionDescriptor, TransactionKind, VLogPos, ValueState, decode_descriptor,
+    decode_head_seq, decode_tx_meta_key, decode_tx_mutation_key, encode_tx_meta_key,
 };
 use crate::db::ManagedInventory;
 use crate::format::FormatMetadataV0;
@@ -134,6 +134,8 @@ fn execute_recovery_with_policy<B: IndexBackend>(
     let mut recovery_state = plan.recovery_state;
 
     if recovery_state.is_none() && (plan.needs_undo || plan.needs_trim) {
+        sync_new_accepted_vlog(&vlog, &plan)?;
+        validate_accepted_boundary(reader, &plan)?;
         let state = RecoveryState {
             phase: RecoveryPhase::Undo,
             original_head: plan.head_seq,
@@ -161,10 +163,6 @@ fn execute_recovery_with_policy<B: IndexBackend>(
             next_undo_seq: undone.target_seq,
             ..undone
         };
-        vlog.sync_accepted_range(
-            durable_end_position(current_frontier.durable_vlog_end),
-            durable_end_position(plan.accepted_end),
-        )?;
         validate_accepted_boundary(reader, &plan)?;
         let target_frontier = DurableFrontier {
             durable_seq: plan.accepted_seq,
@@ -179,10 +177,7 @@ fn execute_recovery_with_policy<B: IndexBackend>(
         current_frontier = target_frontier;
         recovery_state = Some(next_state);
     } else if recovery_state.is_none() && plan.needs_promote {
-        vlog.sync_accepted_range(
-            durable_end_position(current_frontier.durable_vlog_end),
-            durable_end_position(plan.accepted_end),
-        )?;
+        sync_new_accepted_vlog(&vlog, &plan)?;
         validate_accepted_boundary(reader, &plan)?;
         let target_frontier = DurableFrontier {
             durable_seq: plan.accepted_seq,
@@ -236,6 +231,22 @@ fn execute_recovery_with_policy<B: IndexBackend>(
     })
 }
 
+fn sync_new_accepted_vlog(vlog: &ValueLogRecovery, plan: &RecoveryPlan) -> Result<()> {
+    if plan.accepted_vlog_seq == plan.durable_frontier.durable_vlog_seq {
+        if plan.accepted_end != plan.durable_frontier.durable_vlog_end {
+            return Err(recovery_corruption());
+        }
+        return Ok(());
+    }
+    if plan.accepted_vlog_seq < plan.durable_frontier.durable_vlog_seq {
+        return Err(recovery_corruption());
+    }
+    vlog.sync_accepted_range(
+        durable_end_position(plan.durable_frontier.durable_vlog_end),
+        durable_end_position(plan.accepted_end),
+    )
+}
+
 fn validate_recovery_bindings<B: IndexBackend>(
     backend: &B,
     plan: &RecoveryPlan,
@@ -275,7 +286,10 @@ fn validate_recovery_bindings<B: IndexBackend>(
 }
 
 fn validate_accepted_boundary(reader: &ValueLogReader, plan: &RecoveryPlan) -> Result<()> {
-    if plan.accepted_seq == plan.durable_frontier.durable_seq {
+    if plan.accepted_vlog_seq == plan.durable_frontier.durable_vlog_seq {
+        if plan.accepted_end != plan.durable_frontier.durable_vlog_end {
+            return Err(recovery_corruption());
+        }
         return validate_stable_boundary(
             reader,
             DurableFrontier {
@@ -286,7 +300,7 @@ fn validate_accepted_boundary(reader: &ValueLogReader, plan: &RecoveryPlan) -> R
         );
     }
     let relative = plan
-        .accepted_seq
+        .accepted_vlog_seq
         .checked_sub(plan.durable_frontier.durable_seq)
         .and_then(|value| value.checked_sub(1))
         .ok_or_else(recovery_corruption)?;
@@ -295,7 +309,8 @@ fn validate_accepted_boundary(reader: &ValueLogReader, plan: &RecoveryPlan) -> R
         .descriptors
         .get(index)
         .ok_or_else(recovery_corruption)?;
-    if descriptor.meta.commit_seq != plan.accepted_seq
+    if descriptor.meta.commit_seq != plan.accepted_vlog_seq
+        || descriptor.meta.transaction_kind != TransactionKind::VLogEnvelope
         || DurableVLogEnd::Position(descriptor.meta.vlog_end) != plan.accepted_end
     {
         return Err(recovery_corruption());
@@ -603,12 +618,7 @@ fn analyze_recovery_with_policy<B: IndexBackend>(
         )?,
     };
     validate_stable_boundary(reader, durable_frontier)?;
-    let descriptors = load_unstable_descriptors(
-        backend,
-        durable_frontier.durable_seq,
-        head_seq,
-        durable_frontier.durable_vlog_end,
-    )?;
+    let descriptors = load_unstable_descriptors(backend, durable_frontier.durable_seq, head_seq)?;
 
     match recovery_state {
         Some(state) => analyze_fixed_target(
@@ -671,7 +681,6 @@ fn load_unstable_descriptors<B: IndexBackend>(
     backend: &B,
     durable_seq: u64,
     head_seq: u64,
-    durable_end: DurableVLogEnd,
 ) -> Result<Vec<TransactionDescriptor>> {
     let count_u64 = head_seq
         .checked_sub(durable_seq)
@@ -744,7 +753,6 @@ fn load_unstable_descriptors<B: IndexBackend>(
         }
         descriptors.push(descriptor);
     }
-    validate_descriptor_chain(durable_end, &descriptors)?;
     Ok(descriptors)
 }
 
@@ -792,20 +800,6 @@ fn decode_descriptor_key(key: &[u8]) -> Result<(u64, bool)> {
     }
 }
 
-fn validate_descriptor_chain(
-    durable_end: DurableVLogEnd,
-    descriptors: &[TransactionDescriptor],
-) -> Result<()> {
-    let mut expected_begin = append_position(durable_end);
-    for descriptor in descriptors {
-        if descriptor.meta.vlog_begin != expected_begin {
-            return Err(recovery_corruption());
-        }
-        expected_begin = descriptor.meta.vlog_end;
-    }
-    Ok(())
-}
-
 fn analyze_new_target(
     database_identity: Vec<u8>,
     durable_frontier: DurableFrontier,
@@ -816,11 +810,27 @@ fn analyze_new_target(
     reader: &ValueLogReader,
 ) -> Result<RecoveryPlan> {
     let mut accepted_seq = durable_frontier.durable_seq;
+    let mut accepted_vlog_seq = durable_frontier.durable_vlog_seq;
+    let mut accepted_end = durable_frontier.durable_vlog_end;
     for descriptor in &descriptors {
-        match read_and_validate_envelope(reader, descriptor) {
-            Ok(()) => accepted_seq = descriptor.meta.commit_seq,
-            Err(error) if is_rejectable_envelope_error(error.kind) => break,
-            Err(error) => return Err(error),
+        match descriptor.meta.transaction_kind {
+            TransactionKind::IndexOnlyDelete => {
+                accepted_seq = descriptor.meta.commit_seq;
+            }
+            TransactionKind::VLogEnvelope => {
+                if descriptor.meta.vlog_begin != append_position(accepted_end) {
+                    break;
+                }
+                match read_and_validate_envelope(reader, descriptor) {
+                    Ok(()) => {
+                        accepted_seq = descriptor.meta.commit_seq;
+                        accepted_vlog_seq = descriptor.meta.commit_seq;
+                        accepted_end = DurableVLogEnd::Position(descriptor.meta.vlog_end);
+                    }
+                    Err(error) if is_rejectable_envelope_error(error.kind) => break,
+                    Err(error) => return Err(error),
+                }
+            }
         }
     }
     build_plan(
@@ -828,6 +838,8 @@ fn analyze_new_target(
         durable_frontier,
         head_seq,
         accepted_seq,
+        accepted_vlog_seq,
+        accepted_end,
         descriptors,
         None,
         inventory,
@@ -846,7 +858,7 @@ fn analyze_fixed_target(
     reader: &ValueLogReader,
 ) -> Result<RecoveryPlan> {
     validate_recovery_state_against_current(state, durable_frontier, head_seq)?;
-    if state.phase == RecoveryPhase::Undo && state.target_seq > durable_frontier.durable_seq {
+    if state.phase == RecoveryPhase::Undo {
         let accepted_count = usize::try_from(
             state
                 .target_seq
@@ -857,14 +869,37 @@ fn analyze_fixed_target(
         let accepted = descriptors
             .get(..accepted_count)
             .ok_or_else(recovery_corruption)?;
+        let mut accepted_seq = durable_frontier.durable_seq;
+        let mut accepted_vlog_seq = durable_frontier.durable_vlog_seq;
+        let mut accepted_end = durable_frontier.durable_vlog_end;
         for descriptor in accepted {
-            match read_and_validate_envelope(reader, descriptor) {
-                Ok(()) => {}
-                Err(error) if is_rejectable_envelope_error(error.kind) => {
-                    return Err(recovery_corruption());
+            match descriptor.meta.transaction_kind {
+                TransactionKind::IndexOnlyDelete => {
+                    accepted_seq = descriptor.meta.commit_seq;
                 }
-                Err(error) => return Err(error),
+                TransactionKind::VLogEnvelope => {
+                    if descriptor.meta.vlog_begin != append_position(accepted_end) {
+                        return Err(recovery_corruption());
+                    }
+                    match read_and_validate_envelope(reader, descriptor) {
+                        Ok(()) => {
+                            accepted_seq = descriptor.meta.commit_seq;
+                            accepted_vlog_seq = descriptor.meta.commit_seq;
+                            accepted_end = DurableVLogEnd::Position(descriptor.meta.vlog_end);
+                        }
+                        Err(error) if is_rejectable_envelope_error(error.kind) => {
+                            return Err(recovery_corruption());
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
             }
+        }
+        if accepted_seq != state.target_seq
+            || accepted_vlog_seq != state.target_vlog_seq
+            || accepted_end != state.target_vlog_end
+        {
+            return Err(recovery_corruption());
         }
     }
     let mut plan = build_plan(
@@ -872,6 +907,8 @@ fn analyze_fixed_target(
         durable_frontier,
         head_seq,
         state.target_seq,
+        state.target_vlog_seq,
+        state.target_vlog_end,
         descriptors,
         Some(state),
         inventory,
@@ -944,31 +981,27 @@ fn build_plan(
     durable_frontier: DurableFrontier,
     head_seq: u64,
     accepted_seq: u64,
+    accepted_vlog_seq: u64,
+    accepted_end: DurableVLogEnd,
     descriptors: Vec<TransactionDescriptor>,
     recovery_state: Option<RecoveryState>,
     inventory: &ManagedInventory,
     topology: RecoveryTopology,
 ) -> Result<RecoveryPlan> {
-    if accepted_seq < durable_frontier.durable_seq || accepted_seq > head_seq {
+    if accepted_seq < durable_frontier.durable_seq
+        || accepted_seq > head_seq
+        || accepted_vlog_seq < durable_frontier.durable_vlog_seq
+        || accepted_vlog_seq > accepted_seq
+    {
         return Err(recovery_corruption());
     }
-    let published_end = descriptor_end_for_seq(
-        durable_frontier,
-        head_seq,
-        durable_frontier.durable_seq,
-        &descriptors,
-    )?;
-    let accepted_end = descriptor_end_for_seq(
-        durable_frontier,
-        accepted_seq,
-        durable_frontier.durable_seq,
-        &descriptors,
-    )?;
-    let accepted_vlog_seq = if accepted_seq == durable_frontier.durable_seq {
-        durable_frontier.durable_vlog_seq
-    } else {
-        accepted_seq
-    };
+    let published_end = descriptors
+        .iter()
+        .rev()
+        .find(|descriptor| descriptor.meta.transaction_kind == TransactionKind::VLogEnvelope)
+        .map_or(durable_frontier.durable_vlog_end, |descriptor| {
+            DurableVLogEnd::Position(descriptor.meta.vlog_end)
+        });
     if recovery_state.is_some_and(|state| {
         state.target_vlog_seq != accepted_vlog_seq || state.target_vlog_end != accepted_end
     }) || !topology.contains_end(inventory, accepted_end)
@@ -1001,30 +1034,13 @@ fn durable_end_strictly_after(candidate: DurableVLogEnd, base: DurableVLogEnd) -
     }
 }
 
-fn descriptor_end_for_seq(
-    frontier: DurableFrontier,
-    seq: u64,
-    durable_seq: u64,
-    descriptors: &[TransactionDescriptor],
-) -> Result<DurableVLogEnd> {
-    if seq == durable_seq {
-        return Ok(frontier.durable_vlog_end);
-    }
-    let relative = seq
-        .checked_sub(durable_seq)
-        .and_then(|value| value.checked_sub(1))
-        .ok_or_else(recovery_corruption)?;
-    let index = usize::try_from(relative).map_err(|_| recovery_corruption())?;
-    descriptors
-        .get(index)
-        .map(|descriptor| DurableVLogEnd::Position(descriptor.meta.vlog_end))
-        .ok_or_else(recovery_corruption)
-}
-
 fn read_and_validate_envelope(
     reader: &ValueLogReader,
     descriptor: &TransactionDescriptor,
 ) -> Result<()> {
+    if descriptor.meta.transaction_kind != TransactionKind::VLogEnvelope {
+        return Err(recovery_corruption());
+    }
     let envelope = reader.read_recovery_envelope(
         to_vlog_position(descriptor.meta.vlog_begin),
         to_vlog_position(descriptor.meta.vlog_end),

@@ -71,7 +71,9 @@ use runtime::RuntimeControl;
 use stats::StatsState;
 use tempfile::TempDir;
 use vlog::file_set::{FileCatalog, FileSet, VLogDirectory};
-use vlog::format::{VLogGeometry, VLogPosition, ValuePointer};
+use vlog::format::{
+    LayoutPlanner, LogicalOperationRef, VLogGeometry, VLogPosition, ValuePointer, prepare_envelope,
+};
 use vlog::reader::{EnvelopeValueState, ValueLogReader};
 use vlog::writer::{ValueLogWriter, WriterIo};
 
@@ -1494,6 +1496,54 @@ fn stable_boundary_missing_truncated_bad_crc_or_bad_uuid_fails_closed() -> TestR
         }
         assert_corruption(harness.analyze());
     }
+    Ok(())
+}
+
+#[test]
+fn stable_footer_commit_seq_must_equal_durable_vlog_seq_even_with_valid_record_crcs() -> TestResult
+{
+    let harness = Harness::new()?;
+    harness.put(b"stable", b"durable", true)?;
+    let baseline = harness.analyze()?;
+    assert_eq!(baseline.durable_frontier.durable_vlog_seq, 1);
+    let DurableVLogEnd::Position(end) = baseline.durable_frontier.durable_vlog_end else {
+        panic!("stable transaction must have a boundary");
+    };
+    let mut planner = LayoutPlanner::empty(VLogGeometry::PRODUCTION)?;
+    let replacement = prepare_envelope(
+        &mut planner,
+        DATABASE_UUID,
+        2,
+        [0xa2; 16],
+        &[LogicalOperationRef::Put {
+            key: b"stable",
+            value: b"durable",
+        }],
+    )?;
+    assert_eq!(
+        replacement.vlog_end,
+        VLogPosition {
+            file_id: end.file_id,
+            offset: end.offset,
+        }
+    );
+    for chunk in &replacement.chunks {
+        let path = harness
+            .vlog_path
+            .join(format!("D{:06}.data", chunk.position.file_id));
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?
+            .write_all_at(&chunk.bytes, chunk.position.offset)?;
+    }
+
+    let reader = harness.reader()?;
+    let valid_replacement = reader.read_stable_envelope_from_end(replacement.vlog_end)?;
+    assert_eq!(valid_replacement.scanned.commit_seq, 2);
+    assert_eq!(valid_replacement.scanned.vlog_end, replacement.vlog_end);
+
+    assert_corruption(harness.analyze());
     Ok(())
 }
 
