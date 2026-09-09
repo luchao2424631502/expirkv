@@ -589,13 +589,15 @@ fn assert_commit_state(
     harness: &RealCommitHarness,
     expected_head: u64,
     expected_durable: u64,
+    expected_head_vlog: u64,
+    expected_durable_vlog: u64,
     expect_dirty: bool,
 ) {
     let state = harness.coordinator.state_snapshot();
     assert_eq!(state.head_seq, expected_head);
     assert_eq!(state.durable_seq, expected_durable);
-    assert_eq!(state.head_vlog_seq, expected_head);
-    assert_eq!(state.durable_vlog_seq, expected_durable);
+    assert_eq!(state.head_vlog_seq, expected_head_vlog);
+    assert_eq!(state.durable_vlog_seq, expected_durable_vlog);
     if expected_head == expected_durable {
         assert_eq!(state.head_vlog_end, state.durable_vlog_end);
     }
@@ -709,10 +711,13 @@ fn inspect_nonempty_batch<'a>(
         };
         let frontier = DurableFrontier::decode(encoded_frontier)?;
         assert_eq!(frontier.durable_seq, descriptor.meta.commit_seq);
-        assert_eq!(
-            frontier.durable_vlog_end,
-            DurableVLogEnd::Position(descriptor.meta.vlog_end)
-        );
+        if descriptor.meta.transaction_kind == commit::TransactionKind::VLogEnvelope {
+            assert_eq!(frontier.durable_vlog_seq, descriptor.meta.commit_seq);
+            assert_eq!(
+                frontier.durable_vlog_end,
+                DurableVLogEnd::Position(descriptor.meta.vlog_end)
+            );
+        }
         Some(frontier)
     } else {
         None
@@ -723,18 +728,42 @@ fn inspect_nonempty_batch<'a>(
 
 fn assert_descriptor_shape(
     descriptor: &TransactionDescriptor,
+    transaction_kind: commit::TransactionKind,
     commit_seq: u64,
     prev_seq: u64,
     logical_op_count: u64,
     distinct_key_count: u64,
 ) {
     assert_eq!(descriptor.meta.commit_seq, commit_seq);
+    assert_eq!(descriptor.meta.transaction_kind, transaction_kind);
     assert_eq!(descriptor.meta.prev_seq, prev_seq);
     assert_eq!(descriptor.meta.logical_op_count, logical_op_count);
     assert_eq!(descriptor.meta.distinct_key_count, distinct_key_count);
     assert_eq!(descriptor.mutations.len(), distinct_key_count as usize);
     assert_ne!(descriptor.meta.tx_uuid.0, [0; 16]);
-    assert_ne!(descriptor.meta.vlog_begin, descriptor.meta.vlog_end);
+    match transaction_kind {
+        commit::TransactionKind::VLogEnvelope => {
+            assert_ne!(descriptor.meta.vlog_begin, descriptor.meta.vlog_end);
+            assert_ne!(descriptor.meta.envelope_crc32c, 0);
+        }
+        commit::TransactionKind::IndexOnlyDelete => {
+            assert_eq!(
+                descriptor.meta.vlog_begin,
+                VLogPos {
+                    file_id: 0,
+                    offset: 0
+                }
+            );
+            assert_eq!(
+                descriptor.meta.vlog_end,
+                VLogPos {
+                    file_id: 0,
+                    offset: 0
+                }
+            );
+            assert_eq!(descriptor.meta.envelope_crc32c, 0);
+        }
+    }
 }
 
 #[test]
@@ -770,7 +799,14 @@ fn fake_backend_batches_exactly_encode_put_delete_batch_and_sync_shapes() -> Tes
     );
 
     let (put_users, put_descriptor, put_frontier) = inspect_nonempty_batch(&calls[0].0, 1, false)?;
-    assert_descriptor_shape(&put_descriptor, 1, 0, 1, 1);
+    assert_descriptor_shape(
+        &put_descriptor,
+        commit::TransactionKind::VLogEnvelope,
+        1,
+        0,
+        1,
+        1,
+    );
     assert!(put_frontier.is_none());
     let put_pointer = match &put_users[0] {
         IndexMutation::PutUser {
@@ -790,7 +826,14 @@ fn fake_backend_batches_exactly_encode_put_delete_batch_and_sync_shapes() -> Tes
 
     let (delete_users, delete_descriptor, delete_frontier) =
         inspect_nonempty_batch(&calls[1].0, 1, false)?;
-    assert_descriptor_shape(&delete_descriptor, 2, 1, 1, 1);
+    assert_descriptor_shape(
+        &delete_descriptor,
+        commit::TransactionKind::IndexOnlyDelete,
+        2,
+        1,
+        1,
+        1,
+    );
     assert!(delete_frontier.is_none());
     assert!(matches!(
         &delete_users[0],
@@ -807,7 +850,14 @@ fn fake_backend_batches_exactly_encode_put_delete_batch_and_sync_shapes() -> Tes
 
     let (batch_users, batch_descriptor, batch_frontier) =
         inspect_nonempty_batch(&calls[2].0, 2, false)?;
-    assert_descriptor_shape(&batch_descriptor, 3, 2, 3, 2);
+    assert_descriptor_shape(
+        &batch_descriptor,
+        commit::TransactionKind::VLogEnvelope,
+        3,
+        2,
+        3,
+        2,
+    );
     assert!(batch_frontier.is_none());
     let batch_pointer = match &batch_users[0] {
         IndexMutation::PutUser {
@@ -838,7 +888,14 @@ fn fake_backend_batches_exactly_encode_put_delete_batch_and_sync_shapes() -> Tes
 
     let (sync_users, sync_descriptor, sync_frontier) =
         inspect_nonempty_batch(&calls[3].0, 1, true)?;
-    assert_descriptor_shape(&sync_descriptor, 4, 3, 1, 1);
+    assert_descriptor_shape(
+        &sync_descriptor,
+        commit::TransactionKind::VLogEnvelope,
+        4,
+        3,
+        1,
+        1,
+    );
     assert_eq!(sync_frontier.expect("sync frontier").durable_seq, 4);
     let sync_pointer = match &sync_users[0] {
         IndexMutation::PutUser {
@@ -855,6 +912,66 @@ fn fake_backend_batches_exactly_encode_put_delete_batch_and_sync_shapes() -> Tes
             after_state: ValueState::Present(sync_pointer),
         }]
     );
+    Ok(())
+}
+
+#[test]
+fn sync_delete_orders_dirty_put_vlog_sync_before_its_index_only_syncall_batch() -> TestResult {
+    let harness = FakeHarness::new(WriteFailure::None)?;
+    for (key, value) in [
+        (b"a".as_slice(), b"a1".as_slice()),
+        (b"b".as_slice(), b"b1".as_slice()),
+        (b"c".as_slice(), b"c1".as_slice()),
+    ] {
+        harness
+            .coordinator
+            .commit_nonempty(&preflight_put(key, value, false)?)?;
+    }
+    harness.events.lock().unwrap().clear();
+
+    harness
+        .coordinator
+        .commit_nonempty(&preflight_delete(b"b", true)?)?;
+
+    assert_eq!(
+        *harness.events.lock().unwrap(),
+        vec![
+            Event::VLogFileSync,
+            Event::VLogDirectorySync,
+            Event::IndexCommit(IndexCommitMode::SyncAll),
+        ]
+    );
+    let calls = harness.backend.calls();
+    let (_, descriptor, frontier) = inspect_nonempty_batch(&calls[3].0, 1, true)?;
+    assert_descriptor_shape(
+        &descriptor,
+        commit::TransactionKind::IndexOnlyDelete,
+        4,
+        3,
+        1,
+        1,
+    );
+    let frontier = frontier.expect("sync Delete frontier");
+    assert_eq!(frontier.durable_seq, 4);
+    assert_eq!(frontier.durable_vlog_seq, 3);
+    assert_eq!(
+        frontier.durable_vlog_end,
+        harness
+            .coordinator
+            .state_snapshot()
+            .durable_vlog_end
+            .map(|end| DurableVLogEnd::Position(VLogPos {
+                file_id: end.file_id,
+                offset: end.offset,
+            }))
+            .expect("dirty Put prefix has a VLog end")
+    );
+    let state = harness.coordinator.state_snapshot();
+    assert_eq!(state.head_seq, 4);
+    assert_eq!(state.durable_seq, 4);
+    assert_eq!(state.head_vlog_seq, 3);
+    assert_eq!(state.durable_vlog_seq, 3);
+    assert_eq!(state.head_vlog_end, state.durable_vlog_end);
     Ok(())
 }
 
@@ -876,15 +993,17 @@ fn coordinator_rejects_unconverged_reopened_head_and_accepts_stable_state() -> T
     let mut uuid_source = FixedUuid(0x51);
     let prepared = prepare_commit(
         &write,
-        DATABASE_UUID,
         0,
-        writer.position(),
-        writer.geometry(),
+        Some((DATABASE_UUID, writer.position(), writer.geometry())),
         backend.as_ref(),
         &mut uuid_source,
     )?;
-    writer.append(&prepared.envelope)?;
-    let accepted_end = prepared.envelope.vlog_end;
+    let envelope = prepared
+        .envelope
+        .as_ref()
+        .expect("Put must prepare an envelope");
+    writer.append(envelope)?;
+    let accepted_end = envelope.vlog_end;
     let synced = writer.sync_through(1, Some(accepted_end))?;
     writer.frontier_succeeded(synced)?;
     drop(writer);
@@ -1238,7 +1357,7 @@ fn real_buffer_commit_is_readable_before_any_durability_barrier() -> TestResult 
 
     harness.put(key, value, false)?;
 
-    assert_commit_state(&harness, 1, 0, true);
+    assert_commit_state(&harness, 1, 0, 1, 0, true);
     assert_persisted_state(&harness, 1, 0)?;
     let state_before_read = harness.coordinator.state_snapshot();
     assert!(state_before_read.head_vlog_end.is_some());
@@ -1256,7 +1375,7 @@ fn real_buffer_commit_is_readable_before_any_durability_barrier() -> TestResult 
 
     // Reading must not turn the Buffer commit into a durability barrier.
     assert_eq!(harness.coordinator.state_snapshot(), state_before_read);
-    assert_commit_state(&harness, 1, 0, true);
+    assert_commit_state(&harness, 1, 0, 1, 0, true);
     assert_eq!(harness.descriptor_entry_count()?, 2);
     Ok(())
 }
@@ -1289,9 +1408,9 @@ fn t1_production_geometry_all_write_shapes_reconcile_through_real_reader() -> Te
     harness.put(overwrite_key, b"first-version", false)?;
     harness.put(overwrite_key, b"second-version", false)?;
 
-    assert_commit_state(&harness, 9, 0, true);
+    assert_commit_state(&harness, 9, 0, 9, 0, true);
     harness.barrier()?;
-    assert_commit_state(&harness, 9, 9, false);
+    assert_commit_state(&harness, 9, 9, 9, 9, false);
     assert_persisted_state(&harness, 9, 9)?;
 
     let expected = vec![
@@ -1358,7 +1477,7 @@ fn t2_small_geometry_twenty_mixed_operations_cross_pages_and_files() -> TestResu
         "the test must cross at least one VLog file boundary"
     );
     harness.barrier()?;
-    assert_commit_state(&harness, 3, 3, false);
+    assert_commit_state(&harness, 3, 3, 3, 3, false);
 
     let expected = vec![
         (b"a".to_vec(), None),
@@ -1399,7 +1518,7 @@ fn t3_small_cache_reads_ten_large_transactions_across_three_or_more_files() -> T
         expected.push((key.to_vec(), Some(value)));
     }
     harness.barrier()?;
-    assert_commit_state(&harness, 10, 10, false);
+    assert_commit_state(&harness, 10, 10, 10, 10, false);
 
     let mut file_ids = BTreeSet::new();
     for (key, _) in &expected {
@@ -1451,19 +1570,19 @@ fn t4_two_barriers_advance_exact_prefixes_and_preserve_terminal_values() -> Test
     harness.put(b"barrier-a", b"a1", false)?;
     harness.put(b"barrier-b", b"b1", false)?;
     harness.put(b"barrier-c", b"c1", false)?;
-    assert_commit_state(&harness, 3, 0, true);
+    assert_commit_state(&harness, 3, 0, 3, 0, true);
 
     harness.barrier()?;
-    assert_commit_state(&harness, 3, 3, false);
+    assert_commit_state(&harness, 3, 3, 3, 3, false);
     assert_persisted_state(&harness, 3, 3)?;
 
     harness.put(b"barrier-a", b"a2", false)?;
     harness.delete(b"barrier-b", false)?;
-    assert_commit_state(&harness, 5, 3, true);
+    assert_commit_state(&harness, 5, 3, 4, 3, true);
     assert_persisted_state(&harness, 5, 3)?;
 
     harness.barrier()?;
-    assert_commit_state(&harness, 5, 5, false);
+    assert_commit_state(&harness, 5, 5, 4, 4, false);
     assert_persisted_state(&harness, 5, 5)?;
 
     let expected = vec![

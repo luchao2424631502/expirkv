@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rustkv::{
     Db, InstanceState, KeyRange, Operation, Options, ProtocolStage, ReadOptions, StorageErrorKind,
@@ -6,7 +6,7 @@ use rustkv::{
 };
 use tempfile::TempDir;
 
-type TestResult = std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
+type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 fn create_options() -> Options {
     Options {
@@ -24,6 +24,21 @@ fn expect_error<T>(result: rustkv::Result<T>) -> rustkv::StorageError {
         Ok(_) => panic!("operation unexpectedly succeeded"),
         Err(error) => error,
     }
+}
+
+fn vlog_files(root: &Path) -> TestResult<Vec<(PathBuf, u64)>> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(root.join("vlog"))? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('D') && name.ends_with(".data") {
+            files.push((path, entry.metadata()?.len()));
+        }
+    }
+    files.sort_unstable();
+    Ok(files)
 }
 
 #[test]
@@ -76,6 +91,86 @@ fn put_get_delete_overwrite_and_rewrite_use_the_public_path() -> TestResult {
     assert_eq!(read(&db, b"key")?, None);
     db.put(&asynchronous, b"key", b"reborn")?;
     assert_eq!(read(&db, b"key")?, Some(b"reborn".to_vec()));
+    Ok(())
+}
+
+#[test]
+fn public_index_only_deletes_never_create_or_grow_vlog_files() -> TestResult {
+    let folder = TempDir::new()?;
+    let fresh_root = folder.path().join("fresh-delete-db");
+    let db = Db::open(&create_options(), &fresh_root)?;
+    let asynchronous = WriteOptions::default();
+    let synchronous = WriteOptions { sync: true };
+
+    db.delete(&asynchronous, b"missing")?;
+    let mut repeated = WriteBatch::new();
+    repeated.delete(b"alpha")?;
+    repeated.delete(b"beta")?;
+    repeated.delete(b"alpha")?;
+    db.write(&asynchronous, &repeated)?;
+    db.delete(&synchronous, b"alpha")?;
+
+    assert!(vlog_files(&fresh_root)?.is_empty());
+    let stats = db.stats();
+    assert_eq!(stats.head_seq, 3);
+    assert_eq!(stats.durable_seq, 3);
+    assert_eq!(stats.durability_lag, 0);
+    assert!(stats.durable_vlog_end.is_none());
+    assert!(stats.active_vlog_file_id.is_none());
+    assert_eq!(stats.vlog_file_count, 0);
+    assert_eq!(stats.vlog_logical_bytes, 0);
+    drop(db);
+
+    let reopened = Db::open(&Options::default(), &fresh_root)?;
+    assert_eq!(read(&reopened, b"missing")?, None);
+    assert_eq!(read(&reopened, b"alpha")?, None);
+    assert_eq!(read(&reopened, b"beta")?, None);
+    assert!(vlog_files(&fresh_root)?.is_empty());
+    drop(reopened);
+
+    let existing_root = folder.path().join("existing-vlog-db");
+    let db = Db::open(&create_options(), &existing_root)?;
+    let mut seed = WriteBatch::new();
+    seed.put(b"target", b"old-value")?;
+    seed.put(b"survivor", b"keep-value")?;
+    db.write(&synchronous, &seed)?;
+    let files_before = vlog_files(&existing_root)?;
+    let stats_before = db.stats();
+
+    db.delete(&asynchronous, b"target")?;
+    db.delete(&asynchronous, b"not-present")?;
+    let mut all_delete = WriteBatch::new();
+    all_delete.delete(b"target")?;
+    all_delete.delete(b"not-present")?;
+    all_delete.delete(b"target")?;
+    db.write(&synchronous, &all_delete)?;
+
+    assert_eq!(vlog_files(&existing_root)?, files_before);
+    let stats_after = db.stats();
+    assert_eq!(stats_after.head_seq, 4);
+    assert_eq!(stats_after.durable_seq, 4);
+    assert_eq!(
+        stats_after
+            .durable_vlog_end
+            .as_ref()
+            .map(|end| (end.file_id, end.offset)),
+        stats_before
+            .durable_vlog_end
+            .as_ref()
+            .map(|end| (end.file_id, end.offset))
+    );
+    assert_eq!(
+        stats_after.active_vlog_file_id,
+        stats_before.active_vlog_file_id
+    );
+    assert_eq!(stats_after.vlog_file_count, stats_before.vlog_file_count);
+    assert_eq!(
+        stats_after.vlog_logical_bytes,
+        stats_before.vlog_logical_bytes
+    );
+    assert_eq!(read(&db, b"target")?, None);
+    assert_eq!(read(&db, b"not-present")?, None);
+    assert_eq!(read(&db, b"survivor")?, Some(b"keep-value".to_vec()));
     Ok(())
 }
 

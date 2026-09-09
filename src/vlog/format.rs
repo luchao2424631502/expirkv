@@ -1,6 +1,8 @@
 //! Value Log file, page, envelope, record, and pointer encoding.
 #![allow(dead_code)] // Stage 2/3 codecs are connected to file I/O in later stages.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::HashSet;
 
 use crate::{
@@ -30,6 +32,37 @@ pub(crate) const TX_PREPARED_END_ENCODED_LEN: u32 = 111;
 pub(crate) const PAGE_END_MIN_SIZE: u32 = 43;
 pub(crate) const MAX_PAGE_END_LEN_FIRST_PAGE: u32 = 65_472;
 pub(crate) const MAX_PAGE_END_LEN_OTHER_PAGE: u32 = 65_520;
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct VLogFormatCallCounts {
+    pub(crate) commit_layout_plans: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    static VLOG_FORMAT_CALL_COUNTS: Cell<VLogFormatCallCounts> =
+        const { Cell::new(VLogFormatCallCounts { commit_layout_plans: 0 }) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_vlog_format_call_counts_for_test() {
+    VLOG_FORMAT_CALL_COUNTS.with(|counts| counts.set(VLogFormatCallCounts::default()));
+}
+
+#[cfg(test)]
+pub(crate) fn vlog_format_call_counts_for_test() -> VLogFormatCallCounts {
+    VLOG_FORMAT_CALL_COUNTS.with(Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn record_commit_layout_plan_call_for_test() {
+    VLOG_FORMAT_CALL_COUNTS.with(|counts| {
+        let mut updated = counts.get();
+        updated.commit_layout_plans = updated.commit_layout_plans.saturating_add(1);
+        counts.set(updated);
+    });
+}
 
 const PAGE_HEADER_MAGIC: &[u8; 4] = b"RKVP";
 const FILE_HEADER_MAGIC: &[u8; 8] = b"RKVLOG00";

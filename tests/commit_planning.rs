@@ -30,7 +30,7 @@ mod runtime;
 
 use batch::WriteBatch;
 use commit::{
-    TransactionDescriptor, TransactionKind, TxUuidSource, ValueState, decode_descriptor,
+    TransactionDescriptor, TransactionKind, TxUuidSource, VLogPos, ValueState, decode_descriptor,
     decode_head_seq, preflight_batch, preflight_delete, preflight_put, prepare_commit,
 };
 use index::{
@@ -206,19 +206,21 @@ fn assert_delete_user(batch: &IndexAtomicBatch, key: &[u8]) {
 }
 
 #[test]
-fn single_put_and_delete_plan_complete_envelopes_and_atomic_batches() {
+fn put_plans_an_envelope_while_delete_plans_only_an_atomic_index_batch() {
     let backend = FakeBackend::default();
     let mut uuid = FixedUuidSource([0x11; 16]);
     let write = preflight_put(b"alpha", b"", false).unwrap();
     let put = prepare_commit(
         &write,
-        [0x77; 16],
         4,
-        VLogPosition {
-            file_id: 0,
-            offset: 0,
-        },
-        VLogGeometry::PRODUCTION,
+        Some((
+            [0x77; 16],
+            VLogPosition {
+                file_id: 0,
+                offset: 0,
+            },
+            VLogGeometry::PRODUCTION,
+        )),
         &backend,
         &mut uuid,
     )
@@ -227,14 +229,11 @@ fn single_put_and_delete_plan_complete_envelopes_and_atomic_batches() {
     assert_eq!(put.commit_seq, 5);
     assert_eq!(put.tx_uuid.0[6] >> 4, 4, "UUID version must be v4");
     assert_eq!(put.tx_uuid.0[8] >> 6, 2, "UUID variant must be RFC 4122");
-    assert_eq!(put.envelope.value_pointers.len(), 1);
-    assert_eq!(put.vlog_begin.file_id, put.envelope.vlog_begin.file_id);
-    assert_eq!(put.vlog_begin.offset, put.envelope.vlog_begin.offset);
-    assert_eq!(put.vlog_end.file_id, put.envelope.vlog_end.file_id);
-    assert_eq!(put.vlog_end.offset, put.envelope.vlog_end.offset);
-    let pointer = put.envelope.value_pointers[0].unwrap();
-    let chunk = put
-        .envelope
+    assert_eq!(put.transaction_kind, TransactionKind::VLogEnvelope);
+    let put_envelope = put.envelope.as_ref().expect("Put must prepare an envelope");
+    assert_eq!(put_envelope.value_pointers.len(), 1);
+    let pointer = put_envelope.value_pointers[0].unwrap();
+    let chunk = put_envelope
         .chunks
         .iter()
         .find(|chunk| {
@@ -281,33 +280,31 @@ fn single_put_and_delete_plan_complete_envelopes_and_atomic_batches() {
     let backend = FakeBackend::default();
     let mut uuid = FixedUuidSource([0x22; 16]);
     let write = preflight_delete(b"missing", false).unwrap();
-    let delete = prepare_commit(
-        &write,
-        [0x77; 16],
-        5,
-        put.envelope.vlog_end,
-        VLogGeometry::PRODUCTION,
-        &backend,
-        &mut uuid,
-    )
-    .unwrap();
-    let scanned = scan_prepared_envelope(
-        &delete.envelope.chunks,
-        VLogGeometry::PRODUCTION,
-        [0x77; 16],
-        delete.envelope.vlog_begin,
-        delete.envelope.vlog_end,
-        Some(delete.envelope.envelope_crc32c),
-    )
-    .unwrap();
-    assert_eq!(scanned.kv_record_count, 0);
-    assert_eq!(scanned.delete_record_count, 1);
+    let delete = prepare_commit(&write, 5, None, &backend, &mut uuid).unwrap();
+    assert_eq!(delete.transaction_kind, TransactionKind::IndexOnlyDelete);
+    assert!(delete.envelope.is_none());
     let descriptor = descriptor_from_batch(&delete.index_batch);
     assert_eq!(
         descriptor.meta.transaction_kind,
-        TransactionKind::VLogEnvelope,
-        "OPT-1 must not enable the Delete fast path"
+        TransactionKind::IndexOnlyDelete
     );
+    assert_eq!(descriptor.meta.logical_op_count, 1);
+    assert_eq!(descriptor.meta.distinct_key_count, 1);
+    assert_eq!(
+        descriptor.meta.vlog_begin,
+        VLogPos {
+            file_id: 0,
+            offset: 0
+        }
+    );
+    assert_eq!(
+        descriptor.meta.vlog_end,
+        VLogPos {
+            file_id: 0,
+            offset: 0
+        }
+    );
+    assert_eq!(descriptor.meta.envelope_crc32c, 0);
     assert_eq!(descriptor.mutations[0].before_state, ValueState::Absent);
     assert_eq!(descriptor.mutations[0].after_state, ValueState::Absent);
     assert!(matches!(
@@ -323,27 +320,15 @@ fn deleting_an_existing_key_plans_present_to_absent() {
     let backend = FakeBackend::default().with_pointer(b"existing", before);
     let write = preflight_delete(b"existing", false).unwrap();
     let mut uuid = FixedUuidSource([0x2a; 16]);
-    let planned = prepare_commit(
-        &write,
-        [0x77; 16],
-        6,
-        VLogPosition {
-            file_id: 0,
-            offset: 0,
-        },
-        VLogGeometry::PRODUCTION,
-        &backend,
-        &mut uuid,
-    )
-    .unwrap();
+    let planned = prepare_commit(&write, 6, None, &backend, &mut uuid).unwrap();
 
     assert_eq!(backend.read_keys(), vec![b"existing"]);
-    assert_eq!(planned.envelope.value_pointers, vec![None]);
+    assert_eq!(planned.transaction_kind, TransactionKind::IndexOnlyDelete);
+    assert!(planned.envelope.is_none());
     let descriptor = descriptor_from_batch(&planned.index_batch);
     assert_eq!(
         descriptor.meta.transaction_kind,
-        TransactionKind::VLogEnvelope,
-        "OPT-1 must keep existing-key Delete in the VLog"
+        TransactionKind::IndexOnlyDelete
     );
     assert_eq!(descriptor.mutations.len(), 1);
     assert_eq!(descriptor.mutations[0].user_key, b"existing");
@@ -355,19 +340,6 @@ fn deleting_an_existing_key_plans_present_to_absent() {
     assert_eq!(user_mutations(&planned.index_batch).len(), 1);
     assert_delete_user(&planned.index_batch, b"existing");
     assert_head(&planned.index_batch, 7);
-
-    let scanned = scan_prepared_envelope(
-        &planned.envelope.chunks,
-        VLogGeometry::PRODUCTION,
-        [0x77; 16],
-        planned.envelope.vlog_begin,
-        planned.envelope.vlog_end,
-        Some(planned.envelope.envelope_crc32c),
-    )
-    .unwrap();
-    assert_eq!(scanned.logical_op_count, 1);
-    assert_eq!(scanned.kv_record_count, 0);
-    assert_eq!(scanned.delete_record_count, 1);
 }
 
 #[test]
@@ -384,43 +356,49 @@ fn repeated_keys_keep_every_vlog_operation_but_publish_only_final_states() {
     batch.put(b"c", b"c1").unwrap();
     batch.delete(b"d").unwrap();
     batch.delete(b"d").unwrap();
+    batch.put(b"e", b"").unwrap();
 
     let write = preflight_batch(&batch, false).unwrap();
-    assert_eq!(write.logical_op_count(), 8);
-    assert_eq!(write.distinct_key_count(), 4);
+    assert_eq!(write.logical_op_count(), 9);
+    assert_eq!(write.distinct_key_count(), 5);
     let mut uuid = FixedUuidSource([0x33; 16]);
     let planned = prepare_commit(
         &write,
-        [0x88; 16],
         9,
-        VLogPosition {
-            file_id: 0,
-            offset: 0,
-        },
-        VLogGeometry::PRODUCTION,
+        Some((
+            [0x88; 16],
+            VLogPosition {
+                file_id: 0,
+                offset: 0,
+            },
+            VLogGeometry::PRODUCTION,
+        )),
         &backend,
         &mut uuid,
     )
     .unwrap();
 
-    assert_eq!(backend.read_keys(), vec![b"a", b"b", b"c", b"d"]);
+    assert_eq!(backend.read_keys(), vec![b"a", b"b", b"c", b"d", b"e"]);
+    let envelope = planned
+        .envelope
+        .as_ref()
+        .expect("a mixed batch containing Put must retain its envelope");
     let scanned = scan_prepared_envelope(
-        &planned.envelope.chunks,
+        &envelope.chunks,
         VLogGeometry::PRODUCTION,
         [0x88; 16],
-        planned.envelope.vlog_begin,
-        planned.envelope.vlog_end,
-        Some(planned.envelope.envelope_crc32c),
+        envelope.vlog_begin,
+        envelope.vlog_end,
+        Some(envelope.envelope_crc32c),
     )
     .unwrap();
-    assert_eq!(scanned.logical_op_count, 8);
-    assert_eq!(scanned.distinct_key_count, 4);
-    assert_eq!(scanned.kv_record_count, 4);
+    assert_eq!(scanned.logical_op_count, 9);
+    assert_eq!(scanned.distinct_key_count, 5);
+    assert_eq!(scanned.kv_record_count, 5);
     assert_eq!(scanned.delete_record_count, 4);
-    assert_eq!(planned.envelope.value_pointers.len(), 8);
+    assert_eq!(envelope.value_pointers.len(), 9);
 
-    let logical_records = planned
-        .envelope
+    let logical_records = envelope
         .chunks
         .iter()
         .filter(|chunk| chunk.bytes.get(0..4) == Some(b"RKVR".as_slice()))
@@ -456,6 +434,7 @@ fn repeated_keys_keep_every_vlog_operation_but_publish_only_final_states() {
             (5, b"put".as_slice(), b"c".to_vec(), b"c1".to_vec()),
             (6, b"delete".as_slice(), b"d".to_vec(), Vec::new()),
             (7, b"delete".as_slice(), b"d".to_vec(), Vec::new()),
+            (8, b"put".as_slice(), b"e".to_vec(), Vec::new()),
         ]
     );
 
@@ -471,7 +450,7 @@ fn repeated_keys_keep_every_vlog_operation_but_publish_only_final_states() {
             .iter()
             .map(|mutation| mutation.user_key.as_slice())
             .collect::<Vec<_>>(),
-        vec![b"a".as_slice(), b"b", b"c", b"d"]
+        vec![b"a".as_slice(), b"b", b"c", b"d", b"e"]
     );
     assert_eq!(
         descriptor.mutations[0].before_state,
@@ -479,7 +458,7 @@ fn repeated_keys_keep_every_vlog_operation_but_publish_only_final_states() {
     );
     assert_eq!(
         descriptor.mutations[0].after_state,
-        ValueState::Present(planned.envelope.value_pointers[1].unwrap())
+        ValueState::Present(envelope.value_pointers[1].unwrap())
     );
     assert_eq!(descriptor.mutations[1].before_state, ValueState::Absent);
     assert_eq!(descriptor.mutations[1].after_state, ValueState::Absent);
@@ -489,29 +468,105 @@ fn repeated_keys_keep_every_vlog_operation_but_publish_only_final_states() {
     );
     assert_eq!(
         descriptor.mutations[2].after_state,
-        ValueState::Present(planned.envelope.value_pointers[5].unwrap())
+        ValueState::Present(envelope.value_pointers[5].unwrap())
     );
     assert_eq!(descriptor.mutations[3].before_state, ValueState::Absent);
     assert_eq!(descriptor.mutations[3].after_state, ValueState::Absent);
-    assert_eq!(user_mutations(&planned.index_batch).len(), 4);
+    assert_eq!(descriptor.mutations[4].before_state, ValueState::Absent);
+    assert_eq!(
+        descriptor.mutations[4].after_state,
+        ValueState::Present(envelope.value_pointers[8].unwrap())
+    );
+    assert_eq!(user_mutations(&planned.index_batch).len(), 5);
     assert_put_user(
         &planned.index_batch,
         b"a",
-        planned.envelope.value_pointers[1].unwrap(),
+        envelope.value_pointers[1].unwrap(),
     );
     assert_delete_user(&planned.index_batch, b"b");
     assert_put_user(
         &planned.index_batch,
         b"c",
-        planned.envelope.value_pointers[5].unwrap(),
+        envelope.value_pointers[5].unwrap(),
     );
     assert_delete_user(&planned.index_batch, b"d");
+    assert_put_user(
+        &planned.index_batch,
+        b"e",
+        envelope.value_pointers[8].unwrap(),
+    );
     assert_eq!(
         planned.index_batch.len(),
-        10,
-        "4 users + meta + 4 mutations + head"
+        12,
+        "5 users + meta + 5 mutations + head"
     );
     assert_head(&planned.index_batch, 10);
+}
+
+#[test]
+fn a_batch_with_puts_stays_vlog_backed_when_every_final_state_is_absent() {
+    let backend = FakeBackend::default();
+    let mut batch = WriteBatch::new();
+    batch.put(b"gone", b"").unwrap();
+    batch.delete(b"gone").unwrap();
+    batch.delete(b"missing").unwrap();
+    let write = preflight_batch(&batch, false).unwrap();
+    let mut uuid = FixedUuidSource([0x3a; 16]);
+
+    let planned = prepare_commit(
+        &write,
+        10,
+        Some((
+            [0x8a; 16],
+            VLogPosition {
+                file_id: 0,
+                offset: 0,
+            },
+            VLogGeometry::PRODUCTION,
+        )),
+        &backend,
+        &mut uuid,
+    )
+    .unwrap();
+
+    assert_eq!(planned.transaction_kind, TransactionKind::VLogEnvelope);
+    let envelope = planned
+        .envelope
+        .as_ref()
+        .expect("any original Put requires a complete envelope");
+    let scanned = scan_prepared_envelope(
+        &envelope.chunks,
+        VLogGeometry::PRODUCTION,
+        [0x8a; 16],
+        envelope.vlog_begin,
+        envelope.vlog_end,
+        Some(envelope.envelope_crc32c),
+    )
+    .unwrap();
+    assert_eq!(scanned.logical_op_count, 3);
+    assert_eq!(scanned.distinct_key_count, 2);
+    assert_eq!(scanned.kv_record_count, 1);
+    assert_eq!(scanned.delete_record_count, 2);
+    assert_eq!(envelope.value_pointers.len(), 3);
+    assert!(envelope.value_pointers[0].is_some());
+    assert_eq!(envelope.value_pointers[1..], [None, None]);
+
+    let descriptor = descriptor_from_batch(&planned.index_batch);
+    assert_eq!(
+        descriptor.meta.transaction_kind,
+        TransactionKind::VLogEnvelope
+    );
+    assert_eq!(descriptor.meta.logical_op_count, 3);
+    assert_eq!(descriptor.meta.distinct_key_count, 2);
+    assert!(
+        descriptor
+            .mutations
+            .iter()
+            .all(|mutation| mutation.after_state == ValueState::Absent)
+    );
+    assert_delete_user(&planned.index_batch, b"gone");
+    assert_delete_user(&planned.index_batch, b"missing");
+    assert_head(&planned.index_batch, 11);
 }
 
 #[test]
@@ -525,13 +580,15 @@ fn sync_flag_does_not_change_transaction_content_planning() {
     let mut false_uuid = FixedUuidSource([0x44; 16]);
     let false_plan = prepare_commit(
         &false_write,
-        [0x99; 16],
         2,
-        VLogPosition {
-            file_id: 0,
-            offset: 0,
-        },
-        VLogGeometry::PRODUCTION,
+        Some((
+            [0x99; 16],
+            VLogPosition {
+                file_id: 0,
+                offset: 0,
+            },
+            VLogGeometry::PRODUCTION,
+        )),
         &backend,
         &mut false_uuid,
     )
@@ -541,13 +598,15 @@ fn sync_flag_does_not_change_transaction_content_planning() {
     let mut true_uuid = FixedUuidSource([0x44; 16]);
     let true_plan = prepare_commit(
         &true_write,
-        [0x99; 16],
         2,
-        VLogPosition {
-            file_id: 0,
-            offset: 0,
-        },
-        VLogGeometry::PRODUCTION,
+        Some((
+            [0x99; 16],
+            VLogPosition {
+                file_id: 0,
+                offset: 0,
+            },
+            VLogGeometry::PRODUCTION,
+        )),
         &backend,
         &mut true_uuid,
     )

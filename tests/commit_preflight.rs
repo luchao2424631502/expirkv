@@ -29,10 +29,11 @@ mod runtime;
 
 use batch::WriteBatch;
 use commit::{
-    AllocationFailureSite, DescriptorAllocationFailureSite, TxUuidSource,
-    inject_allocation_failure_for_test, inject_descriptor_allocation_failure_for_test,
-    preflight_batch, preflight_batch_with_operation_limit_for_test, preflight_delete,
-    preflight_put, prepare_commit, validate_operation_count_for_test,
+    AllocationFailureSite, DescriptorAllocationFailureSite, PreparedCommit, TransactionKind,
+    TxUuidSource, ValidatedWrite, inject_allocation_failure_for_test,
+    inject_descriptor_allocation_failure_for_test, preflight_batch,
+    preflight_batch_with_operation_limit_for_test, preflight_delete, preflight_put,
+    prepare_commit as prepare_commit_inner, validate_operation_count_for_test,
 };
 use index::{
     IndexAtomicBatch, IndexBackend, IndexCommitError, IndexCommitMode, IndexEntry,
@@ -42,6 +43,27 @@ use vlog_format::{
     PrepareAllocationFailureSite, VLogGeometry, VLogPosition, ValuePointer,
     inject_prepare_allocation_failure_for_test,
 };
+
+fn prepare_commit<B, U>(
+    write: &ValidatedWrite<'_>,
+    database_uuid: [u8; 16],
+    head_seq: u64,
+    append_cursor: VLogPosition,
+    geometry: VLogGeometry,
+    index: &B,
+    uuid_source: &mut U,
+) -> Result<PreparedCommit>
+where
+    B: IndexBackend,
+    U: TxUuidSource,
+{
+    let vlog_context = (write.transaction_kind() == TransactionKind::VLogEnvelope).then_some((
+        database_uuid,
+        append_cursor,
+        geometry,
+    ));
+    prepare_commit_inner(write, head_seq, vlog_context, index, uuid_source)
+}
 
 #[derive(Clone, Debug)]
 enum UserReadBehavior {
