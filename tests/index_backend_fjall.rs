@@ -65,6 +65,7 @@ fn encoded_initial_metadata(uuid_byte: u8) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let head_seq = descriptor::encode_head_seq(0).to_vec();
     let frontier = descriptor::DurableFrontier {
         durable_seq: 0,
+        durable_vlog_seq: 0,
         durable_vlog_end: descriptor::DurableVLogEnd::Empty,
     }
     .encode()

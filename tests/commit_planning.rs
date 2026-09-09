@@ -30,8 +30,8 @@ mod runtime;
 
 use batch::WriteBatch;
 use commit::{
-    TransactionDescriptor, TxUuidSource, ValueState, decode_descriptor, decode_head_seq,
-    preflight_batch, preflight_delete, preflight_put, prepare_commit,
+    TransactionDescriptor, TransactionKind, TxUuidSource, ValueState, decode_descriptor,
+    decode_head_seq, preflight_batch, preflight_delete, preflight_put, prepare_commit,
 };
 use index::{
     HEAD_SEQ_KEY, IndexAtomicBatch, IndexBackend, IndexCommitError, IndexCommitMode, IndexEntry,
@@ -254,6 +254,10 @@ fn single_put_and_delete_plan_complete_envelopes_and_atomic_batches() {
     assert_eq!(pointer.value_len, 0);
 
     let descriptor = descriptor_from_batch(&put.index_batch);
+    assert_eq!(
+        descriptor.meta.transaction_kind,
+        TransactionKind::VLogEnvelope
+    );
     assert_eq!(descriptor.meta.prev_seq, 4);
     assert_eq!(descriptor.meta.logical_op_count, 1);
     assert_eq!(descriptor.meta.distinct_key_count, 1);
@@ -299,6 +303,11 @@ fn single_put_and_delete_plan_complete_envelopes_and_atomic_batches() {
     assert_eq!(scanned.kv_record_count, 0);
     assert_eq!(scanned.delete_record_count, 1);
     let descriptor = descriptor_from_batch(&delete.index_batch);
+    assert_eq!(
+        descriptor.meta.transaction_kind,
+        TransactionKind::VLogEnvelope,
+        "OPT-1 must not enable the Delete fast path"
+    );
     assert_eq!(descriptor.mutations[0].before_state, ValueState::Absent);
     assert_eq!(descriptor.mutations[0].after_state, ValueState::Absent);
     assert!(matches!(
@@ -331,6 +340,11 @@ fn deleting_an_existing_key_plans_present_to_absent() {
     assert_eq!(backend.read_keys(), vec![b"existing"]);
     assert_eq!(planned.envelope.value_pointers, vec![None]);
     let descriptor = descriptor_from_batch(&planned.index_batch);
+    assert_eq!(
+        descriptor.meta.transaction_kind,
+        TransactionKind::VLogEnvelope,
+        "OPT-1 must keep existing-key Delete in the VLog"
+    );
     assert_eq!(descriptor.mutations.len(), 1);
     assert_eq!(descriptor.mutations[0].user_key, b"existing");
     assert_eq!(
@@ -446,6 +460,11 @@ fn repeated_keys_keep_every_vlog_operation_but_publish_only_final_states() {
     );
 
     let descriptor = descriptor_from_batch(&planned.index_batch);
+    assert_eq!(
+        descriptor.meta.transaction_kind,
+        TransactionKind::VLogEnvelope,
+        "OPT-1 must keep every nonempty WriteBatch in the VLog"
+    );
     assert_eq!(
         descriptor
             .mutations

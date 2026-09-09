@@ -291,8 +291,10 @@ impl Harness {
             0,
             DurableFrontier {
                 durable_seq: 0,
+                durable_vlog_seq: 0,
                 durable_vlog_end: DurableVLogEnd::Empty,
             },
+            0,
             None,
         )?;
         Ok(Self {
@@ -382,11 +384,14 @@ fn empty_sync_advances_only_frontier_and_never_allocates_a_transaction() -> Test
     };
     let committed_frontier = DurableFrontier::decode(encoded_frontier)?;
     assert_eq!(committed_frontier.durable_seq, 1);
+    assert_eq!(committed_frontier.durable_vlog_seq, 1);
     assert_eq!(harness.backend.transaction_len(), 2);
     assert_eq!(harness.uuid_calls.load(Ordering::SeqCst), 1);
     let state = harness.coordinator.state_snapshot();
     assert_eq!(state.head_seq, 1);
     assert_eq!(state.durable_seq, 1);
+    assert_eq!(state.head_vlog_seq, 1);
+    assert_eq!(state.durable_vlog_seq, 1);
     assert_eq!(state.head_vlog_end, state.durable_vlog_end);
     assert_eq!(
         committed_frontier.durable_vlog_end,

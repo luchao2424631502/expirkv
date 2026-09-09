@@ -68,6 +68,7 @@ impl FakeIndex {
         let backend = Self::default();
         let frontier = DurableFrontier {
             durable_seq,
+            durable_vlog_seq: durable_seq,
             durable_vlog_end: if durable_seq == 0 {
                 DurableVLogEnd::Empty
             } else {

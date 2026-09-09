@@ -383,6 +383,7 @@ impl FakeHarness {
             FixedUuid(1),
             0,
             empty_frontier(),
+            0,
             None,
         )?);
         Ok(Self {
@@ -462,6 +463,7 @@ impl RealCommitHarness {
             FixedUuid(0x41),
             0,
             empty_frontier(),
+            0,
             None,
         )?;
         Ok(Self {
@@ -592,6 +594,8 @@ fn assert_commit_state(
     let state = harness.coordinator.state_snapshot();
     assert_eq!(state.head_seq, expected_head);
     assert_eq!(state.durable_seq, expected_durable);
+    assert_eq!(state.head_vlog_seq, expected_head);
+    assert_eq!(state.durable_vlog_seq, expected_durable);
     if expected_head == expected_durable {
         assert_eq!(state.head_vlog_end, state.durable_vlog_end);
     }
@@ -627,6 +631,7 @@ fn assert_first_latched_matches(runtime: &RuntimeControl, error: &StorageError) 
 fn empty_frontier() -> DurableFrontier {
     DurableFrontier {
         durable_seq: 0,
+        durable_vlog_seq: 0,
         durable_vlog_end: DurableVLogEnd::Empty,
     }
 }
@@ -903,6 +908,7 @@ fn coordinator_rejects_unconverged_reopened_head_and_accepts_stable_state() -> T
         FixedUuid(0x61),
         1,
         empty_frontier(),
+        0,
         Some(accepted_end),
     )
     .err()
@@ -920,6 +926,7 @@ fn coordinator_rejects_unconverged_reopened_head_and_accepts_stable_state() -> T
     )?;
     let stable_frontier = DurableFrontier {
         durable_seq: 1,
+        durable_vlog_seq: 1,
         durable_vlog_end: DurableVLogEnd::Position(VLogPos {
             file_id: accepted_end.file_id,
             offset: accepted_end.offset,
@@ -933,6 +940,7 @@ fn coordinator_rejects_unconverged_reopened_head_and_accepts_stable_state() -> T
         FixedUuid(0x71),
         1,
         stable_frontier,
+        1,
         Some(accepted_end),
     )?;
     assert_eq!(
@@ -940,6 +948,8 @@ fn coordinator_rejects_unconverged_reopened_head_and_accepts_stable_state() -> T
         commit::CommitStateSnapshot {
             head_seq: 1,
             durable_seq: 1,
+            head_vlog_seq: 1,
+            durable_vlog_seq: 1,
             head_vlog_end: Some(accepted_end),
             durable_vlog_end: Some(accepted_end),
         }
@@ -956,6 +966,8 @@ fn buffer_then_syncall_publish_one_atomic_batch_each_in_protocol_order() -> Test
     let state = harness.coordinator.state_snapshot();
     assert_eq!(state.head_seq, 1);
     assert_eq!(state.durable_seq, 0);
+    assert_eq!(state.head_vlog_seq, 1);
+    assert_eq!(state.durable_vlog_seq, 0);
     assert!(state.head_vlog_end.is_some());
     assert!(state.durable_vlog_end.is_none());
     let calls = harness.backend.calls();
@@ -987,6 +999,8 @@ fn buffer_then_syncall_publish_one_atomic_batch_each_in_protocol_order() -> Test
     let state = harness.coordinator.state_snapshot();
     assert_eq!(state.head_seq, 2);
     assert_eq!(state.durable_seq, 2);
+    assert_eq!(state.head_vlog_seq, 2);
+    assert_eq!(state.durable_vlog_seq, 2);
     assert_eq!(state.head_vlog_end, state.durable_vlog_end);
     let calls = harness.backend.calls();
     assert_eq!(calls.len(), 2);

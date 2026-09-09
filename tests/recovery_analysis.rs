@@ -269,8 +269,10 @@ impl Harness {
             0,
             DurableFrontier {
                 durable_seq: 0,
+                durable_vlog_seq: 0,
                 durable_vlog_end: DurableVLogEnd::Empty,
             },
+            0,
             None,
         )?;
         Ok(Self {
@@ -819,7 +821,7 @@ fn later_descriptor_corruption_is_found_before_any_envelope_prefix_is_selected()
         .iter_mut()
         .find(|entry| entry.key.len() == 11)
         .expect("TxMeta");
-    meta.value[82] ^= 1;
+    meta.value[83] ^= 1;
     harness.commit_index_mutations(vec![IndexMutation::PutInternal {
         space: InternalIndexSpace::Transaction,
         key: meta.key.clone(),
@@ -874,6 +876,7 @@ fn existing_recovery_state_keeps_its_target_instead_of_recomputing_c() -> TestRe
         phase: RecoveryPhase::Undo,
         original_head: 3,
         target_seq: 1,
+        target_vlog_seq: 1,
         target_vlog_end: target_end,
         next_undo_seq: 3,
         trim_required: true,
@@ -901,6 +904,7 @@ fn undo_state_allows_a_previously_required_suffix_to_be_already_gone() -> TestRe
         phase: RecoveryPhase::Undo,
         original_head: 2,
         target_seq: 1,
+        target_vlog_seq: 1,
         target_vlog_end: target_end,
         next_undo_seq: 2,
         trim_required: true,
@@ -926,6 +930,7 @@ fn undo_state_rejects_an_unplanned_new_physical_suffix() -> TestResult {
         phase: RecoveryPhase::Undo,
         original_head: 2,
         target_seq: 1,
+        target_vlog_seq: 1,
         target_vlog_end: baseline.durable_frontier.durable_vlog_end,
         next_undo_seq: 2,
         trim_required: false,
@@ -947,6 +952,7 @@ fn undo_state_without_trim_continues_when_the_physical_tail_matches_target() -> 
         phase: RecoveryPhase::Undo,
         original_head: 2,
         target_seq: 1,
+        target_vlog_seq: 1,
         target_vlog_end: target_end,
         next_undo_seq: 2,
         trim_required: false,
@@ -974,6 +980,7 @@ fn trim_and_finalize_states_cover_complete_and_incomplete_physical_cleanup() -> 
             phase: RecoveryPhase::Trim,
             original_head: 1,
             target_seq: 1,
+            target_vlog_seq: 1,
             target_vlog_end: baseline.accepted_end,
             next_undo_seq: 1,
             trim_required: true,
@@ -993,6 +1000,7 @@ fn trim_and_finalize_states_cover_complete_and_incomplete_physical_cleanup() -> 
             phase: RecoveryPhase::Finalize,
             original_head: 1,
             target_seq: 1,
+            target_vlog_seq: 1,
             target_vlog_end: baseline.accepted_end,
             next_undo_seq: 1,
             trim_required: false,
@@ -1011,6 +1019,7 @@ fn trim_and_finalize_states_cover_complete_and_incomplete_physical_cleanup() -> 
             phase: RecoveryPhase::Finalize,
             original_head: 1,
             target_seq: 1,
+            target_vlog_seq: 1,
             target_vlog_end: baseline.accepted_end,
             next_undo_seq: 1,
             trim_required: false,
@@ -1040,6 +1049,7 @@ fn empty_target_reentry_covers_undo_trim_and_finalize_phases() -> TestResult {
             phase: RecoveryPhase::Undo,
             original_head: 1,
             target_seq: 0,
+            target_vlog_seq: 0,
             target_vlog_end: DurableVLogEnd::Empty,
             next_undo_seq: 1,
             trim_required,
@@ -1070,6 +1080,7 @@ fn empty_target_reentry_covers_undo_trim_and_finalize_phases() -> TestResult {
             phase: RecoveryPhase::Trim,
             original_head: 1,
             target_seq: 0,
+            target_vlog_seq: 0,
             target_vlog_end: DurableVLogEnd::Empty,
             next_undo_seq: 0,
             trim_required: true,
@@ -1094,6 +1105,7 @@ fn empty_target_reentry_covers_undo_trim_and_finalize_phases() -> TestResult {
             phase: RecoveryPhase::Finalize,
             original_head: 1,
             target_seq: 0,
+            target_vlog_seq: 0,
             target_vlog_end: DurableVLogEnd::Empty,
             next_undo_seq: 0,
             trim_required: false,
@@ -1124,8 +1136,65 @@ fn existing_recovery_state_rejects_phase_metadata_and_target_mismatches() -> Tes
             phase: RecoveryPhase::Undo,
             original_head: 1,
             target_seq: 0,
+            target_vlog_seq: 0,
             target_vlog_end: DurableVLogEnd::Empty,
             next_undo_seq: 1,
+            trim_required: true,
+        })?;
+        assert_corruption(harness.analyze());
+    }
+
+    // A fixed VLog target may never fall behind the durable VLog sequence.
+    {
+        let harness = Harness::new()?;
+        harness.put(b"stable", b"v1", true)?;
+        harness.install_recovery_state(RecoveryState {
+            phase: RecoveryPhase::Undo,
+            original_head: 1,
+            target_seq: 1,
+            target_vlog_seq: 0,
+            target_vlog_end: DurableVLogEnd::Empty,
+            next_undo_seq: 1,
+            trim_required: true,
+        })?;
+        assert_corruption(harness.analyze());
+    }
+
+    // Equal VLog sequence requires the exact durable physical end.
+    {
+        let harness = Harness::new()?;
+        harness.put(b"stable", b"v1", true)?;
+        let baseline = harness.analyze()?;
+        let DurableVLogEnd::Position(end) = baseline.accepted_end else {
+            panic!("stable transaction must have an end");
+        };
+        harness.install_recovery_state(RecoveryState {
+            phase: RecoveryPhase::Undo,
+            original_head: 1,
+            target_seq: 1,
+            target_vlog_seq: 1,
+            target_vlog_end: DurableVLogEnd::Position(commit::VLogPos {
+                file_id: end.file_id,
+                offset: end.offset - 1,
+            }),
+            next_undo_seq: 1,
+            trim_required: true,
+        })?;
+        assert_corruption(harness.analyze());
+    }
+
+    // Advancing the VLog sequence requires a physical end strictly beyond E.
+    {
+        let harness = Harness::new()?;
+        harness.put(b"stable", b"v1", true)?;
+        let baseline = harness.analyze()?;
+        harness.install_recovery_state(RecoveryState {
+            phase: RecoveryPhase::Undo,
+            original_head: 2,
+            target_seq: 2,
+            target_vlog_seq: 2,
+            target_vlog_end: baseline.accepted_end,
+            next_undo_seq: 2,
             trim_required: true,
         })?;
         assert_corruption(harness.analyze());
@@ -1139,6 +1208,7 @@ fn existing_recovery_state_rejects_phase_metadata_and_target_mismatches() -> Tes
             phase: RecoveryPhase::Undo,
             original_head: 1,
             target_seq: 0,
+            target_vlog_seq: 0,
             target_vlog_end: DurableVLogEnd::Empty,
             next_undo_seq: 0,
             trim_required: true,
@@ -1158,6 +1228,7 @@ fn existing_recovery_state_rejects_phase_metadata_and_target_mismatches() -> Tes
             phase,
             original_head: 2,
             target_seq: 2,
+            target_vlog_seq: 2,
             target_vlog_end: DurableVLogEnd::Position(end),
             next_undo_seq: 2,
             trim_required: phase == RecoveryPhase::Trim,
@@ -1182,6 +1253,7 @@ fn existing_recovery_state_rejects_phase_metadata_and_target_mismatches() -> Tes
             phase: RecoveryPhase::Undo,
             original_head: 2,
             target_seq: 1,
+            target_vlog_seq: 1,
             target_vlog_end: wrong_end,
             next_undo_seq: 1,
             trim_required: true,
@@ -1202,6 +1274,7 @@ fn fixed_recovery_target_fails_closed_when_its_accepted_envelope_is_damaged() ->
         phase: RecoveryPhase::Undo,
         original_head: 2,
         target_seq: 1,
+        target_vlog_seq: 1,
         target_vlog_end: target_end,
         next_undo_seq: 2,
         trim_required: true,
@@ -1451,7 +1524,7 @@ fn unstable_descriptor_missing_gap_partial_crc_and_unexplainable_state_fail_clos
                 key: entries[mutation_index].key.clone(),
             }],
             "crc" => {
-                entries[meta_index].value[82] ^= 1;
+                entries[meta_index].value[83] ^= 1;
                 vec![IndexMutation::PutInternal {
                     space: InternalIndexSpace::Transaction,
                     key: entries[meta_index].key.clone(),
@@ -1489,11 +1562,11 @@ fn rewrite_descriptor_crc(entries: &mut [IndexEntry]) {
         .position(|entry| entry.key.len() == 11)
         .expect("TxMeta");
     let mut crc = crc32c(b"RKDESC0");
-    crc = crc32c_append(crc, &entries[meta_index].value[..82]);
+    crc = crc32c_append(crc, &entries[meta_index].value[..83]);
     for entry in entries.iter().filter(|entry| entry.key.len() == 19) {
         crc = crc32c_append(crc, &entry.key);
         crc = crc32c_append(crc, &(entry.value.len() as u32).to_le_bytes());
         crc = crc32c_append(crc, &entry.value);
     }
-    entries[meta_index].value[82..86].copy_from_slice(&crc.to_le_bytes());
+    entries[meta_index].value[83..87].copy_from_slice(&crc.to_le_bytes());
 }

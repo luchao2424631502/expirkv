@@ -39,6 +39,7 @@ pub(crate) struct RecoveryPlan {
     pub(crate) durable_frontier: DurableFrontier,
     pub(crate) head_seq: u64,
     pub(crate) accepted_seq: u64,
+    pub(crate) accepted_vlog_seq: u64,
     pub(crate) published_end: DurableVLogEnd,
     pub(crate) accepted_end: DurableVLogEnd,
     pub(crate) physical_tail: PhysicalTail,
@@ -137,6 +138,7 @@ fn execute_recovery_with_policy<B: IndexBackend>(
             phase: RecoveryPhase::Undo,
             original_head: plan.head_seq,
             target_seq: plan.accepted_seq,
+            target_vlog_seq: plan.accepted_vlog_seq,
             target_vlog_end: plan.accepted_end,
             next_undo_seq: plan.head_seq,
             trim_required: plan.needs_trim,
@@ -166,6 +168,7 @@ fn execute_recovery_with_policy<B: IndexBackend>(
         validate_accepted_boundary(reader, &plan)?;
         let target_frontier = DurableFrontier {
             durable_seq: plan.accepted_seq,
+            durable_vlog_seq: plan.accepted_vlog_seq,
             durable_vlog_end: plan.accepted_end,
         };
         commit_recovery_batch(
@@ -183,6 +186,7 @@ fn execute_recovery_with_policy<B: IndexBackend>(
         validate_accepted_boundary(reader, &plan)?;
         let target_frontier = DurableFrontier {
             durable_seq: plan.accepted_seq,
+            durable_vlog_seq: plan.accepted_vlog_seq,
             durable_vlog_end: plan.accepted_end,
         };
         commit_recovery_batch(
@@ -276,6 +280,7 @@ fn validate_accepted_boundary(reader: &ValueLogReader, plan: &RecoveryPlan) -> R
             reader,
             DurableFrontier {
                 durable_seq: plan.accepted_seq,
+                durable_vlog_seq: plan.accepted_vlog_seq,
                 durable_vlog_end: plan.accepted_end,
             },
         );
@@ -637,18 +642,18 @@ fn required_internal<B: IndexBackend>(backend: &B, key: &[u8]) -> Result<Vec<u8>
 
 fn validate_stable_boundary(reader: &ValueLogReader, frontier: DurableFrontier) -> Result<()> {
     let DurableVLogEnd::Position(end) = frontier.durable_vlog_end else {
-        if frontier.durable_seq != 0 {
+        if frontier.durable_vlog_seq != 0 {
             return Err(recovery_corruption());
         }
         return Ok(());
     };
-    if frontier.durable_seq == 0 {
+    if frontier.durable_vlog_seq == 0 {
         return Err(recovery_corruption());
     }
     let envelope = reader
         .read_stable_envelope_from_end(to_vlog_position(end))
         .map_err(recovery_context)?;
-    if envelope.scanned.commit_seq != frontier.durable_seq
+    if envelope.scanned.commit_seq != frontier.durable_vlog_seq
         || envelope.scanned.vlog_end != to_vlog_position(end)
     {
         return Err(recovery_corruption());
@@ -902,7 +907,15 @@ fn validate_recovery_state_against_current(
     frontier: DurableFrontier,
     head_seq: u64,
 ) -> Result<()> {
-    if state.target_seq < frontier.durable_seq {
+    if state.target_seq < frontier.durable_seq || state.target_vlog_seq < frontier.durable_vlog_seq
+    {
+        return Err(recovery_corruption());
+    }
+    if state.target_vlog_seq == frontier.durable_vlog_seq {
+        if state.target_vlog_end != frontier.durable_vlog_end {
+            return Err(recovery_corruption());
+        }
+    } else if !durable_end_strictly_after(state.target_vlog_end, frontier.durable_vlog_end) {
         return Err(recovery_corruption());
     }
     match state.phase {
@@ -914,6 +927,7 @@ fn validate_recovery_state_against_current(
         RecoveryPhase::Trim | RecoveryPhase::Finalize => {
             if head_seq != state.target_seq
                 || frontier.durable_seq != state.target_seq
+                || frontier.durable_vlog_seq != state.target_vlog_seq
                 || frontier.durable_vlog_end != state.target_vlog_end
                 || state.next_undo_seq != state.target_seq
             {
@@ -950,8 +964,14 @@ fn build_plan(
         durable_frontier.durable_seq,
         &descriptors,
     )?;
-    if recovery_state.is_some_and(|state| state.target_vlog_end != accepted_end)
-        || !topology.contains_end(inventory, accepted_end)
+    let accepted_vlog_seq = if accepted_seq == durable_frontier.durable_seq {
+        durable_frontier.durable_vlog_seq
+    } else {
+        accepted_seq
+    };
+    if recovery_state.is_some_and(|state| {
+        state.target_vlog_seq != accepted_vlog_seq || state.target_vlog_end != accepted_end
+    }) || !topology.contains_end(inventory, accepted_end)
     {
         return Err(recovery_corruption());
     }
@@ -961,6 +981,7 @@ fn build_plan(
         durable_frontier,
         head_seq,
         accepted_seq,
+        accepted_vlog_seq,
         published_end,
         accepted_end,
         physical_tail: topology.physical_tail,
@@ -970,6 +991,14 @@ fn build_plan(
         needs_promote: accepted_seq > durable_frontier.durable_seq,
         needs_trim,
     })
+}
+
+fn durable_end_strictly_after(candidate: DurableVLogEnd, base: DurableVLogEnd) -> bool {
+    match (candidate, base) {
+        (DurableVLogEnd::Position(_), DurableVLogEnd::Empty) => true,
+        (DurableVLogEnd::Position(candidate), DurableVLogEnd::Position(base)) => candidate > base,
+        (DurableVLogEnd::Empty, _) => false,
+    }
 }
 
 fn descriptor_end_for_seq(

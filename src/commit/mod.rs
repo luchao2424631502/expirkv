@@ -10,8 +10,9 @@ pub(crate) use coordinator::{CommitCoordinator, CommitStateSnapshot};
 #[allow(unused_imports)]
 pub(crate) use descriptor::{
     CommitSeq, DurableFrontier, DurableVLogEnd, RECOVERY_STATE_KEY, RecoveryPhase, RecoveryState,
-    TransactionDescriptor, TxMutation, TxUuid, VLogPos, ValueState, decode_descriptor,
-    decode_head_seq, decode_tx_meta_key, decode_tx_mutation_key, encode_tx_meta_key,
+    TransactionDescriptor, TransactionKind, TxMutation, TxUuid, VLogPos, ValueState,
+    decode_descriptor, decode_head_seq, decode_tx_meta_key, decode_tx_mutation_key,
+    encode_tx_meta_key,
 };
 
 #[allow(unused_imports)]

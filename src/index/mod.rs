@@ -14,7 +14,7 @@ const DATABASE_IDENTITY_MAGIC: &[u8; 4] = b"RKDI";
 const DURABLE_FRONTIER_MAGIC: &[u8; 4] = b"RKDF";
 const DATABASE_IDENTITY_ENCODED_LEN: usize = 32;
 const HEAD_SEQ_ENCODED_LEN: usize = 8;
-const DURABLE_FRONTIER_ENCODED_LEN: usize = 31;
+const DURABLE_FRONTIER_ENCODED_LEN: usize = 39;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DatabaseIdentityV0 {
@@ -96,8 +96,8 @@ pub(crate) fn initialization_batch(
     let head_seq = [0_u8; HEAD_SEQ_ENCODED_LEN];
     let mut frontier = [0_u8; DURABLE_FRONTIER_ENCODED_LEN];
     frontier[0..4].copy_from_slice(DURABLE_FRONTIER_MAGIC);
-    let frontier_crc = crc32c(&frontier[0..27]);
-    frontier[27..31].copy_from_slice(&frontier_crc.to_le_bytes());
+    let frontier_crc = crc32c(&frontier[0..35]);
+    frontier[35..39].copy_from_slice(&frontier_crc.to_le_bytes());
 
     IndexAtomicBatch::initialize_database(
         try_copy_fixed(&identity)?,
@@ -475,8 +475,8 @@ pub(crate) fn is_encoded_head_seq_zero(encoded: &[u8]) -> bool {
 pub(crate) fn is_encoded_empty_durable_frontier(encoded: &[u8]) -> bool {
     encoded.len() == DURABLE_FRONTIER_ENCODED_LEN
         && encoded.get(0..4) == Some(DURABLE_FRONTIER_MAGIC.as_slice())
-        && encoded.get(4..27) == Some([0_u8; 23].as_slice())
-        && has_valid_trailing_crc(encoded, 27)
+        && encoded.get(4..35) == Some([0_u8; 31].as_slice())
+        && has_valid_trailing_crc(encoded, 35)
 }
 
 fn has_valid_trailing_crc(encoded: &[u8], crc_offset: usize) -> bool {

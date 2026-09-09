@@ -412,8 +412,10 @@ impl Harness {
             0,
             DurableFrontier {
                 durable_seq: 0,
+                durable_vlog_seq: 0,
                 durable_vlog_end: DurableVLogEnd::Empty,
             },
+            0,
             None,
         )?;
         Ok(Self {
@@ -790,6 +792,7 @@ fn every_undo_batch_is_atomic_and_reopen_resumes_at_the_persisted_sequence() -> 
             phase: RecoveryPhase::Undo,
             original_head: 4,
             target_seq: 2,
+            target_vlog_seq: 2,
             target_vlog_end: plan.accepted_end,
             next_undo_seq: 4,
             trim_required: true,
@@ -849,6 +852,7 @@ fn frontier_and_finalize_commit_boundaries_resume_without_guessing() -> TestResu
             phase: RecoveryPhase::Undo,
             original_head: 2,
             target_seq: 2,
+            target_vlog_seq: 2,
             target_vlog_end: plan.accepted_end,
             next_undo_seq: 2,
             trim_required: false,
@@ -892,6 +896,7 @@ fn frontier_and_finalize_commit_boundaries_resume_without_guessing() -> TestResu
             phase: RecoveryPhase::Finalize,
             original_head: 1,
             target_seq: 1,
+            target_vlog_seq: 1,
             target_vlog_end: plan.accepted_end,
             next_undo_seq: 1,
             trim_required: false,
@@ -986,6 +991,7 @@ fn prepared_trim_state() -> TestResult<Harness> {
         phase: RecoveryPhase::Trim,
         original_head: 1,
         target_seq: 1,
+        target_vlog_seq: 1,
         target_vlog_end: plan.accepted_end,
         next_undo_seq: 1,
         trim_required: true,

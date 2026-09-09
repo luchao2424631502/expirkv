@@ -21,6 +21,8 @@ use super::protocol::{TxUuidSource, ValidatedWrite, prepare_commit};
 pub(crate) struct CommitStateSnapshot {
     pub(crate) head_seq: CommitSeq,
     pub(crate) durable_seq: CommitSeq,
+    pub(crate) head_vlog_seq: CommitSeq,
+    pub(crate) durable_vlog_seq: CommitSeq,
     pub(crate) head_vlog_end: Option<VLogPosition>,
     pub(crate) durable_vlog_end: Option<VLogPosition>,
 }
@@ -29,6 +31,7 @@ pub(crate) struct CommitStateSnapshot {
 struct CommitState {
     head_seq: CommitSeq,
     durable_frontier: DurableFrontier,
+    head_vlog_seq: CommitSeq,
     head_vlog_end: Option<VLogPosition>,
 }
 
@@ -55,9 +58,16 @@ where
         uuid_source: U,
         head_seq: CommitSeq,
         durable_frontier: DurableFrontier,
+        head_vlog_seq: CommitSeq,
         head_vlog_end: Option<VLogPosition>,
     ) -> Result<Self> {
-        validate_initial_state(head_seq, durable_frontier, head_vlog_end, &writer)?;
+        validate_initial_state(
+            head_seq,
+            durable_frontier,
+            head_vlog_seq,
+            head_vlog_end,
+            &writer,
+        )?;
         let coordinator = Self {
             runtime,
             stats,
@@ -67,6 +77,7 @@ where
             state: Mutex::new(CommitState {
                 head_seq,
                 durable_frontier,
+                head_vlog_seq,
                 head_vlog_end,
             }),
             durability: DurabilityCoordinator::new(),
@@ -216,14 +227,15 @@ where
             return Ok(());
         }
         let target_end = captured.head_vlog_end;
-        let frontier = frontier_from_optional(captured.head_seq, target_end);
+        let frontier =
+            frontier_from_optional(captured.head_seq, captured.head_vlog_seq, target_end);
         let batch = match frontier_only_batch(frontier, Operation::WriteBatch) {
             Ok(batch) => batch,
             Err(error) => return Err(self.fail_started(ticket, error, None, None)),
         };
 
         let mut writer = lock(&self.writer);
-        let synced = match writer.sync_through(captured.head_seq, target_end) {
+        let synced = match writer.sync_through(captured.head_vlog_seq, target_end) {
             Ok(synced) => synced,
             Err(error) => {
                 let error = remap_writer_operation(error, Operation::WriteBatch);
@@ -291,6 +303,7 @@ where
         {
             let mut state = lock(&self.state);
             state.head_seq = commit_seq;
+            state.head_vlog_seq = commit_seq;
             state.head_vlog_end = Some(vlog_end);
             if let Some(frontier) = frontier {
                 state.durable_frontier = frontier;
@@ -355,6 +368,7 @@ where
 fn validate_initial_state(
     head_seq: CommitSeq,
     frontier: DurableFrontier,
+    head_vlog_seq: CommitSeq,
     head_vlog_end: Option<VLogPosition>,
     writer: &ValueLogWriter,
 ) -> Result<()> {
@@ -362,20 +376,22 @@ fn validate_initial_state(
         .validate_against_head(head_seq)
         .map_err(|_| initial_state_error())?;
     let durable_end = descriptor_end_to_format(frontier.durable_vlog_end);
-    let valid_empty = head_seq == 0
-        && head_vlog_end.is_none()
-        && frontier.durable_seq == 0
-        && durable_end.is_none()
-        && writer.position()
-            == VLogPosition {
-                file_id: 0,
-                offset: 0,
-            };
-    let valid_nonempty = head_seq > 0
-        && frontier.durable_seq == head_seq
-        && head_vlog_end == Some(writer.position())
+    let valid_logical_frontier = frontier.durable_seq == head_seq
+        && frontier.durable_vlog_seq == head_vlog_seq
+        && head_vlog_seq <= head_seq
         && durable_end == head_vlog_end;
-    if writer.database_uuid() == [0; 16] || !(valid_empty || valid_nonempty) {
+    let valid_vlog_frontier = match (head_vlog_seq, head_vlog_end) {
+        (0, None) => {
+            writer.position()
+                == VLogPosition {
+                    file_id: 0,
+                    offset: 0,
+                }
+        }
+        (0, Some(_)) | (_, None) => false,
+        (_, Some(end)) => end == writer.position(),
+    };
+    if writer.database_uuid() == [0; 16] || !valid_logical_frontier || !valid_vlog_frontier {
         return Err(initial_state_error());
     }
     Ok(())
@@ -394,6 +410,7 @@ fn initial_state_error() -> StorageError {
 fn frontier_for(seq: CommitSeq, end: VLogPosition) -> DurableFrontier {
     DurableFrontier {
         durable_seq: seq,
+        durable_vlog_seq: seq,
         durable_vlog_end: DurableVLogEnd::Position(VLogPos {
             file_id: end.file_id,
             offset: end.offset,
@@ -401,15 +418,28 @@ fn frontier_for(seq: CommitSeq, end: VLogPosition) -> DurableFrontier {
     }
 }
 
-fn frontier_from_optional(seq: CommitSeq, end: Option<VLogPosition>) -> DurableFrontier {
-    match (seq, end) {
+fn frontier_from_optional(
+    seq: CommitSeq,
+    vlog_seq: CommitSeq,
+    end: Option<VLogPosition>,
+) -> DurableFrontier {
+    match (vlog_seq, end) {
         (0, None) => DurableFrontier {
-            durable_seq: 0,
+            durable_seq: seq,
+            durable_vlog_seq: 0,
             durable_vlog_end: DurableVLogEnd::Empty,
         },
-        (_, Some(end)) => frontier_for(seq, end),
+        (_, Some(end)) => DurableFrontier {
+            durable_seq: seq,
+            durable_vlog_seq: vlog_seq,
+            durable_vlog_end: DurableVLogEnd::Position(VLogPos {
+                file_id: end.file_id,
+                offset: end.offset,
+            }),
+        },
         _ => DurableFrontier {
             durable_seq: seq,
+            durable_vlog_seq: vlog_seq,
             durable_vlog_end: DurableVLogEnd::Empty,
         },
     }
@@ -429,6 +459,8 @@ fn snapshot(state: CommitState) -> CommitStateSnapshot {
     CommitStateSnapshot {
         head_seq: state.head_seq,
         durable_seq: state.durable_frontier.durable_seq,
+        head_vlog_seq: state.head_vlog_seq,
+        durable_vlog_seq: state.durable_frontier.durable_vlog_seq,
         head_vlog_end: state.head_vlog_end,
         durable_vlog_end: descriptor_end_to_format(state.durable_frontier.durable_vlog_end),
     }

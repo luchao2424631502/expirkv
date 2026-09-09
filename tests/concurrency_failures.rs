@@ -293,8 +293,10 @@ impl RealFailureHarness {
             0,
             DurableFrontier {
                 durable_seq: 0,
+                durable_vlog_seq: 0,
                 durable_vlog_end: DurableVLogEnd::Empty,
             },
+            0,
             None,
         )?);
         Ok(Self {

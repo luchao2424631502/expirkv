@@ -17,8 +17,8 @@ use crate::vlog::format::{
 use crate::{InstanceState, Operation, Result, RetryAdvice, StorageError, StorageErrorKind};
 
 use super::descriptor::{
-    CommitSeq, TransactionDescriptor, TxMeta, TxMutation, TxUuid, VLogPos, ValueState,
-    encode_descriptor, encode_head_seq, next_commit_seq,
+    CommitSeq, TransactionDescriptor, TransactionKind, TxMeta, TxMutation, TxUuid, VLogPos,
+    ValueState, encode_descriptor, encode_head_seq, next_commit_seq,
 };
 
 const MAX_KEY_VALUE_SIZE: usize = 60_000;
@@ -301,6 +301,7 @@ where
     let mutations = descriptor_mutations(&key_plans, write.public_operation)?;
     let descriptor = TransactionDescriptor {
         meta: TxMeta {
+            transaction_kind: TransactionKind::VLogEnvelope,
             commit_seq,
             tx_uuid,
             prev_seq: head_seq,

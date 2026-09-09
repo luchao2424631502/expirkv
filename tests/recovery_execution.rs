@@ -187,8 +187,10 @@ impl Harness {
             0,
             DurableFrontier {
                 durable_seq: 0,
+                durable_vlog_seq: 0,
                 durable_vlog_end: DurableVLogEnd::Empty,
             },
+            0,
             None,
         )?;
         Ok(Self {
@@ -802,6 +804,7 @@ fn trim_truncates_boundary_deletes_higher_suffix_and_finalize_only_clears_state(
         phase: RecoveryPhase::Finalize,
         original_head: 1,
         target_seq: 1,
+        target_vlog_seq: 1,
         target_vlog_end: stable.accepted_end,
         next_undo_seq: 1,
         trim_required: false,

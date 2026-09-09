@@ -1518,6 +1518,7 @@ impl Db {
             OsTxUuidSource,
             recovered.head_seq,
             recovered.durable_frontier,
+            recovered.durable_frontier.durable_vlog_seq,
             head_vlog_end,
         )?);
         let (lifecycle, lease) = LifecycleController::new_with_external_lease();
