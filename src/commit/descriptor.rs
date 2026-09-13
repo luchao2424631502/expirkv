@@ -19,11 +19,11 @@ pub(crate) const RECOVERY_STATE_KEY: &[u8] = b"recovery_state";
 
 pub(crate) const TX_META_KEY_ENCODED_LEN: usize = 11;
 pub(crate) const TX_MUTATION_KEY_ENCODED_LEN: usize = 19;
-pub(crate) const TX_META_ENCODED_LEN: usize = 86;
+pub(crate) const TX_META_ENCODED_LEN: usize = 87;
 pub(crate) const DATABASE_IDENTITY_ENCODED_LEN: usize = 32;
 pub(crate) const HEAD_SEQ_ENCODED_LEN: usize = 8;
-pub(crate) const DURABLE_FRONTIER_ENCODED_LEN: usize = 31;
-pub(crate) const RECOVERY_STATE_ENCODED_LEN: usize = 49;
+pub(crate) const DURABLE_FRONTIER_ENCODED_LEN: usize = 39;
+pub(crate) const RECOVERY_STATE_ENCODED_LEN: usize = 57;
 
 const TX_KEY_MAGIC: [u8; 2] = *b"TX";
 const TX_META_KIND: u8 = 0;
@@ -91,9 +91,30 @@ pub(crate) enum DurableVLogEnd {
     Position(VLogPos),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TransactionKind {
+    VLogEnvelope = 0,
+    IndexOnlyDelete = 1,
+}
+
+impl TransactionKind {
+    fn encode(self) -> u8 {
+        self as u8
+    }
+
+    fn decode(encoded: u8) -> Result<Self> {
+        match encoded {
+            0 => Ok(Self::VLogEnvelope),
+            1 => Ok(Self::IndexOnlyDelete),
+            _ => Err(decode_corruption()),
+        }
+    }
+}
+
 // 事务 head结构
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TxMeta {
+    pub(crate) transaction_kind: TransactionKind,
     pub(crate) commit_seq: CommitSeq,
     pub(crate) tx_uuid: TxUuid,
     pub(crate) prev_seq: CommitSeq,
@@ -127,6 +148,39 @@ pub(crate) struct TransactionDescriptor {
     pub(crate) mutations: Vec<TxMutation>,
 }
 
+#[cfg(test)]
+impl TransactionDescriptor {
+    pub(crate) fn encode_index_only_delete_for_test(
+        commit_seq: CommitSeq,
+        tx_uuid: [u8; 16],
+        logical_op_count: u64,
+        mutations: Vec<TxMutation>,
+    ) -> Result<EncodedDescriptor> {
+        let distinct_key_count = u64::try_from(mutations.len()).map_err(|_| encode_capacity())?;
+        encode_descriptor(&Self {
+            meta: TxMeta {
+                transaction_kind: TransactionKind::IndexOnlyDelete,
+                commit_seq,
+                tx_uuid: TxUuid(tx_uuid),
+                prev_seq: commit_seq.checked_sub(1).ok_or_else(encode_invalid)?,
+                vlog_begin: VLogPos {
+                    file_id: 0,
+                    offset: 0,
+                },
+                vlog_end: VLogPos {
+                    file_id: 0,
+                    offset: 0,
+                },
+                logical_op_count,
+                distinct_key_count,
+                envelope_crc32c: 0,
+                descriptor_crc32c: 0,
+            },
+            mutations,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct EncodedMutation {
     pub(crate) key: [u8; TX_MUTATION_KEY_ENCODED_LEN],
@@ -152,6 +206,7 @@ pub(crate) struct DatabaseIdentity {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DurableFrontier {
     pub(crate) durable_seq: CommitSeq,
+    pub(crate) durable_vlog_seq: CommitSeq,
     pub(crate) durable_vlog_end: DurableVLogEnd,
 }
 
@@ -167,6 +222,7 @@ pub(crate) struct RecoveryState {
     pub(crate) phase: RecoveryPhase,
     pub(crate) original_head: CommitSeq,
     pub(crate) target_seq: CommitSeq,
+    pub(crate) target_vlog_seq: CommitSeq,
     pub(crate) target_vlog_end: DurableVLogEnd,
     pub(crate) next_undo_seq: CommitSeq,
     pub(crate) trim_required: bool,
@@ -233,15 +289,16 @@ pub(crate) fn encode_tx_meta(meta: &TxMeta) -> Result<[u8; TX_META_ENCODED_LEN]>
     let mut encoded = [0_u8; TX_META_ENCODED_LEN];
     encoded[0..4].copy_from_slice(&TX_META_MAGIC);
     encoded[4..6].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
-    encoded[6..14].copy_from_slice(&meta.commit_seq.to_le_bytes());
-    encoded[14..30].copy_from_slice(&meta.tx_uuid.0);
-    encoded[30..38].copy_from_slice(&meta.prev_seq.to_le_bytes());
-    write_vlog_pos(&mut encoded, 38, meta.vlog_begin);
-    write_vlog_pos(&mut encoded, 50, meta.vlog_end);
-    encoded[62..70].copy_from_slice(&meta.logical_op_count.to_le_bytes());
-    encoded[70..78].copy_from_slice(&meta.distinct_key_count.to_le_bytes());
-    encoded[78..82].copy_from_slice(&meta.envelope_crc32c.to_le_bytes());
-    encoded[82..86].copy_from_slice(&meta.descriptor_crc32c.to_le_bytes());
+    encoded[6] = meta.transaction_kind.encode();
+    encoded[7..15].copy_from_slice(&meta.commit_seq.to_le_bytes());
+    encoded[15..31].copy_from_slice(&meta.tx_uuid.0);
+    encoded[31..39].copy_from_slice(&meta.prev_seq.to_le_bytes());
+    write_vlog_pos(&mut encoded, 39, meta.vlog_begin);
+    write_vlog_pos(&mut encoded, 51, meta.vlog_end);
+    encoded[63..71].copy_from_slice(&meta.logical_op_count.to_le_bytes());
+    encoded[71..79].copy_from_slice(&meta.distinct_key_count.to_le_bytes());
+    encoded[79..83].copy_from_slice(&meta.envelope_crc32c.to_le_bytes());
+    encoded[83..87].copy_from_slice(&meta.descriptor_crc32c.to_le_bytes());
     Ok(encoded)
 }
 
@@ -255,15 +312,16 @@ pub(crate) fn decode_tx_meta(encoded: &[u8]) -> Result<TxMeta> {
     }
 
     let meta = TxMeta {
-        commit_seq: read_u64_le(encoded, 6).ok_or_else(decode_corruption)?,
-        tx_uuid: TxUuid(read_array(encoded, 14).ok_or_else(decode_corruption)?),
-        prev_seq: read_u64_le(encoded, 30).ok_or_else(decode_corruption)?,
-        vlog_begin: read_vlog_pos(encoded, 38).ok_or_else(decode_corruption)?,
-        vlog_end: read_vlog_pos(encoded, 50).ok_or_else(decode_corruption)?,
-        logical_op_count: read_u64_le(encoded, 62).ok_or_else(decode_corruption)?,
-        distinct_key_count: read_u64_le(encoded, 70).ok_or_else(decode_corruption)?,
-        envelope_crc32c: read_u32_le(encoded, 78).ok_or_else(decode_corruption)?,
-        descriptor_crc32c: read_u32_le(encoded, 82).ok_or_else(decode_corruption)?,
+        transaction_kind: TransactionKind::decode(*encoded.get(6).ok_or_else(decode_corruption)?)?,
+        commit_seq: read_u64_le(encoded, 7).ok_or_else(decode_corruption)?,
+        tx_uuid: TxUuid(read_array(encoded, 15).ok_or_else(decode_corruption)?),
+        prev_seq: read_u64_le(encoded, 31).ok_or_else(decode_corruption)?,
+        vlog_begin: read_vlog_pos(encoded, 39).ok_or_else(decode_corruption)?,
+        vlog_end: read_vlog_pos(encoded, 51).ok_or_else(decode_corruption)?,
+        logical_op_count: read_u64_le(encoded, 63).ok_or_else(decode_corruption)?,
+        distinct_key_count: read_u64_le(encoded, 71).ok_or_else(decode_corruption)?,
+        envelope_crc32c: read_u32_le(encoded, 79).ok_or_else(decode_corruption)?,
+        descriptor_crc32c: read_u32_le(encoded, 83).ok_or_else(decode_corruption)?,
     };
     validate_tx_meta(&meta, false)?;
     Ok(meta)
@@ -340,6 +398,11 @@ pub(crate) fn encode_descriptor(descriptor: &TransactionDescriptor) -> Result<En
         return Err(encode_invalid());
     }
     validate_tx_meta(&descriptor.meta, true)?;
+    validate_transaction_mutations(
+        descriptor.meta.transaction_kind,
+        &descriptor.mutations,
+        true,
+    )?;
 
     let mut seen_keys: HashSet<&[u8]> = HashSet::new();
     inject_descriptor_allocation_failure(DescriptorAllocationFailureSite::SeenKeys)?;
@@ -402,7 +465,7 @@ pub(crate) fn decode_descriptor(
         .map_err(|_| decode_allocation())?;
 
     let mut crc = crc32c(DESCRIPTOR_CRC_MAGIC);
-    crc = crc32c_append(crc, meta_value.get(0..82).ok_or_else(decode_corruption)?);
+    crc = crc32c_append(crc, meta_value.get(0..83).ok_or_else(decode_corruption)?);
 
     for (expected_ordinal, (key, value)) in mutation_entries.iter().enumerate() {
         let (commit_seq, ordinal) = decode_tx_mutation_key(key)?;
@@ -427,6 +490,7 @@ pub(crate) fn decode_descriptor(
     if crc != meta.descriptor_crc32c {
         return Err(decode_corruption());
     }
+    validate_transaction_mutations(meta.transaction_kind, &mutations, false)?;
     Ok(TransactionDescriptor { meta, mutations })
 }
 
@@ -515,9 +579,10 @@ impl DurableFrontier {
         encoded[0..4].copy_from_slice(&DURABLE_FRONTIER_MAGIC);
         encoded[4..6].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
         encoded[6..14].copy_from_slice(&self.durable_seq.to_le_bytes());
-        write_durable_end(&mut encoded, 14, self.durable_vlog_end);
-        let checksum = crc32c(&encoded[0..27]);
-        encoded[27..31].copy_from_slice(&checksum.to_le_bytes());
+        encoded[14..22].copy_from_slice(&self.durable_vlog_seq.to_le_bytes());
+        write_durable_end(&mut encoded, 22, self.durable_vlog_end);
+        let checksum = crc32c(&encoded[0..35]);
+        encoded[35..39].copy_from_slice(&checksum.to_le_bytes());
         Ok(encoded)
     }
 
@@ -527,7 +592,7 @@ impl DurableFrontier {
         {
             return Err(decode_corruption());
         }
-        verify_crc(encoded, 27, 27)?;
+        verify_crc(encoded, 35, 35)?;
         let format_version = read_u16_le(encoded, 4).ok_or_else(decode_corruption)?;
         if format_version != FORMAT_VERSION {
             return Err(decode_incompatible());
@@ -535,7 +600,8 @@ impl DurableFrontier {
 
         let frontier = Self {
             durable_seq: read_u64_le(encoded, 6).ok_or_else(decode_corruption)?,
-            durable_vlog_end: read_durable_end(encoded, 14)?,
+            durable_vlog_seq: read_u64_le(encoded, 14).ok_or_else(decode_corruption)?,
+            durable_vlog_end: read_durable_end(encoded, 22)?,
         };
         frontier.validate()?;
         Ok(frontier)
@@ -550,7 +616,10 @@ impl DurableFrontier {
     }
 
     fn validate(&self) -> Result<()> {
-        match (self.durable_seq, self.durable_vlog_end) {
+        if self.durable_vlog_seq > self.durable_seq {
+            return Err(decode_corruption());
+        }
+        match (self.durable_vlog_seq, self.durable_vlog_end) {
             (0, DurableVLogEnd::Empty) => Ok(()),
             (0, DurableVLogEnd::Position(_)) | (_, DurableVLogEnd::Empty) => {
                 Err(decode_corruption())
@@ -576,11 +645,12 @@ impl RecoveryState {
         };
         encoded[7..15].copy_from_slice(&self.original_head.to_le_bytes());
         encoded[15..23].copy_from_slice(&self.target_seq.to_le_bytes());
-        write_durable_end(&mut encoded, 23, self.target_vlog_end);
-        encoded[36..44].copy_from_slice(&self.next_undo_seq.to_le_bytes());
-        encoded[44] = u8::from(self.trim_required);
-        let checksum = crc32c(&encoded[0..45]);
-        encoded[45..49].copy_from_slice(&checksum.to_le_bytes());
+        encoded[23..31].copy_from_slice(&self.target_vlog_seq.to_le_bytes());
+        write_durable_end(&mut encoded, 31, self.target_vlog_end);
+        encoded[44..52].copy_from_slice(&self.next_undo_seq.to_le_bytes());
+        encoded[52] = u8::from(self.trim_required);
+        let checksum = crc32c(&encoded[0..53]);
+        encoded[53..57].copy_from_slice(&checksum.to_le_bytes());
         Ok(encoded)
     }
 
@@ -590,7 +660,7 @@ impl RecoveryState {
         {
             return Err(decode_corruption());
         }
-        verify_crc(encoded, 45, 45)?;
+        verify_crc(encoded, 53, 53)?;
         let format_version = read_u16_le(encoded, 4).ok_or_else(decode_corruption)?;
         if format_version != FORMAT_VERSION {
             return Err(decode_incompatible());
@@ -602,7 +672,7 @@ impl RecoveryState {
             Some(3) => RecoveryPhase::Finalize,
             _ => return Err(decode_corruption()),
         };
-        let trim_required = match encoded.get(44) {
+        let trim_required = match encoded.get(52) {
             Some(0) => false,
             Some(1) => true,
             _ => return Err(decode_corruption()),
@@ -611,8 +681,9 @@ impl RecoveryState {
             phase,
             original_head: read_u64_le(encoded, 7).ok_or_else(decode_corruption)?,
             target_seq: read_u64_le(encoded, 15).ok_or_else(decode_corruption)?,
-            target_vlog_end: read_durable_end(encoded, 23)?,
-            next_undo_seq: read_u64_le(encoded, 36).ok_or_else(decode_corruption)?,
+            target_vlog_seq: read_u64_le(encoded, 23).ok_or_else(decode_corruption)?,
+            target_vlog_end: read_durable_end(encoded, 31)?,
+            next_undo_seq: read_u64_le(encoded, 44).ok_or_else(decode_corruption)?,
             trim_required,
         };
         state.validate()?;
@@ -620,10 +691,13 @@ impl RecoveryState {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.target_seq > self.next_undo_seq || self.next_undo_seq > self.original_head {
+        if self.target_vlog_seq > self.target_seq
+            || self.target_seq > self.next_undo_seq
+            || self.next_undo_seq > self.original_head
+        {
             return Err(decode_corruption());
         }
-        match (self.target_seq, self.target_vlog_end) {
+        match (self.target_vlog_seq, self.target_vlog_end) {
             (0, DurableVLogEnd::Empty) => {}
             (0, DurableVLogEnd::Position(_)) | (_, DurableVLogEnd::Empty) => {
                 return Err(decode_corruption());
@@ -660,14 +734,51 @@ fn validate_tx_meta(meta: &TxMeta, encoding: bool) -> Result<()> {
     if meta.commit_seq == 0
         || meta.prev_seq != meta.commit_seq.checked_sub(1).ok_or_else(invalid)?
         || !meta.tx_uuid.is_valid()
-        || !meta.vlog_begin.is_valid()
-        || !meta.vlog_end.is_valid()
-        || meta.vlog_begin >= meta.vlog_end
         || meta.logical_op_count == 0
         || meta.distinct_key_count == 0
         || meta.distinct_key_count > meta.logical_op_count
     {
         return Err(invalid());
+    }
+    match meta.transaction_kind {
+        TransactionKind::VLogEnvelope
+            if meta.vlog_begin.is_valid()
+                && meta.vlog_end.is_valid()
+                && meta.vlog_begin < meta.vlog_end => {}
+        TransactionKind::IndexOnlyDelete
+            if meta.vlog_begin
+                == VLogPos {
+                    file_id: 0,
+                    offset: 0,
+                }
+                && meta.vlog_end
+                    == VLogPos {
+                        file_id: 0,
+                        offset: 0,
+                    }
+                && meta.envelope_crc32c == 0 => {}
+        TransactionKind::VLogEnvelope | TransactionKind::IndexOnlyDelete => {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
+fn validate_transaction_mutations(
+    kind: TransactionKind,
+    mutations: &[TxMutation],
+    encoding: bool,
+) -> Result<()> {
+    if kind == TransactionKind::IndexOnlyDelete
+        && mutations
+            .iter()
+            .any(|mutation| !matches!(mutation.after_state, ValueState::Absent))
+    {
+        return Err(if encoding {
+            encode_invalid()
+        } else {
+            decode_corruption()
+        });
     }
     Ok(())
 }
@@ -747,7 +858,7 @@ fn descriptor_crc(
     encoding: bool,
 ) -> Result<u32> {
     let mut crc = crc32c(DESCRIPTOR_CRC_MAGIC);
-    crc = crc32c_append(crc, &meta_value[0..82]);
+    crc = crc32c_append(crc, &meta_value[0..83]);
     for mutation in mutations {
         let value_len = u32::try_from(mutation.value.len()).map_err(|_| {
             if encoding {

@@ -5,8 +5,8 @@ use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -63,8 +63,8 @@ use db::ManagedInventory;
 use format::FormatMetadataV0;
 use index::{
     DURABLE_FRONTIER_KEY, FjallBackend, FjallIndexOptions, HEAD_SEQ_KEY, IndexAtomicBatch,
-    IndexBackend, IndexCommitMode, IndexCompression, IndexMutation, InternalIndexSpace,
-    initialization_batch,
+    IndexBackend, IndexCommitError, IndexCommitMode, IndexCompression, IndexMutation,
+    InternalIndexSpace, InternalKeyRange, initialization_batch,
 };
 use lock::RootLock;
 use recovery::{
@@ -108,6 +108,142 @@ struct RecoveryIo {
     directory_syncs: AtomicUsize,
     truncates: AtomicUsize,
     deletes: AtomicUsize,
+}
+
+#[derive(Default)]
+struct FailAcceptedSyncIo {
+    file_syncs: AtomicUsize,
+    directory_syncs: AtomicUsize,
+    truncates: AtomicUsize,
+    deletes: AtomicUsize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryOrderEvent {
+    AcceptedFileSyncComplete,
+    AcceptedDirectorySyncComplete,
+    RecoveryStateCommitEntered,
+}
+
+struct OrderedRecoveryIo {
+    events: Arc<Mutex<Vec<RecoveryOrderEvent>>>,
+}
+
+impl WriterIo for OrderedRecoveryIo {
+    fn write_at(&self, file: &File, bytes: &[u8], offset: u64) -> io::Result<usize> {
+        file.write_at(bytes, offset)
+    }
+
+    fn sync_file(&self, file: &File) -> io::Result<()> {
+        file.sync_data()?;
+        self.events
+            .lock()
+            .expect("event mutex poisoned")
+            .push(RecoveryOrderEvent::AcceptedFileSyncComplete);
+        Ok(())
+    }
+
+    fn sync_directory(&self, directory: &VLogDirectory) -> io::Result<()> {
+        directory.sync()?;
+        self.events
+            .lock()
+            .expect("event mutex poisoned")
+            .push(RecoveryOrderEvent::AcceptedDirectorySyncComplete);
+        Ok(())
+    }
+}
+
+struct OrderedRecoveryBackend {
+    inner: Arc<FjallBackend>,
+    events: Arc<Mutex<Vec<RecoveryOrderEvent>>>,
+}
+
+impl IndexBackend for OrderedRecoveryBackend {
+    type Snapshot = <FjallBackend as IndexBackend>::Snapshot;
+    type UserIterator = <FjallBackend as IndexBackend>::UserIterator;
+    type InternalIterator = <FjallBackend as IndexBackend>::InternalIterator;
+
+    fn commit_atomic(
+        &self,
+        batch: IndexAtomicBatch,
+        mode: IndexCommitMode,
+    ) -> std::result::Result<(), IndexCommitError> {
+        let creates_recovery_state = batch.len() == 1
+            && batch.operations().iter().any(|operation| {
+                matches!(
+                    operation,
+                    IndexMutation::PutInternal {
+                        space: InternalIndexSpace::System,
+                        key,
+                        ..
+                    } if key.as_slice() == RECOVERY_STATE_KEY
+                )
+            });
+        if creates_recovery_state {
+            self.events
+                .lock()
+                .expect("event mutex poisoned")
+                .push(RecoveryOrderEvent::RecoveryStateCommitEntered);
+        }
+        self.inner.commit_atomic(batch, mode)
+    }
+
+    fn get_database_identity(&self) -> Result<Option<Vec<u8>>> {
+        self.inner.get_database_identity()
+    }
+
+    fn get_user(&self, key: &[u8], snapshot: Option<&Self::Snapshot>) -> Result<Option<Vec<u8>>> {
+        self.inner.get_user(key, snapshot)
+    }
+
+    fn get_internal(&self, space: InternalIndexSpace, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.inner.get_internal(space, key)
+    }
+
+    fn scan_internal(
+        &self,
+        space: InternalIndexSpace,
+        range: InternalKeyRange,
+    ) -> Result<Self::InternalIterator> {
+        self.inner.scan_internal(space, range)
+    }
+
+    fn snapshot(&self) -> Result<Self::Snapshot> {
+        self.inner.snapshot()
+    }
+
+    fn iter_user(&self, snapshot: Option<&Self::Snapshot>) -> Result<Self::UserIterator> {
+        self.inner.iter_user(snapshot)
+    }
+}
+
+impl WriterIo for FailAcceptedSyncIo {
+    fn write_at(&self, file: &File, bytes: &[u8], offset: u64) -> io::Result<usize> {
+        file.write_at(bytes, offset)
+    }
+
+    fn sync_file(&self, _file: &File) -> io::Result<()> {
+        self.file_syncs.fetch_add(1, Ordering::SeqCst);
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "injected accepted-prefix sync failure",
+        ))
+    }
+
+    fn sync_directory(&self, _directory: &VLogDirectory) -> io::Result<()> {
+        self.directory_syncs.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn truncate_file(&self, _file: &File, _len: u64) -> io::Result<()> {
+        self.truncates.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn before_remove_recovery_file(&self, _file_id: u32) -> io::Result<()> {
+        self.deletes.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
 }
 
 impl WriterIo for RecoveryIo {
@@ -187,8 +323,10 @@ impl Harness {
             0,
             DurableFrontier {
                 durable_seq: 0,
+                durable_vlog_seq: 0,
                 durable_vlog_end: DurableVLogEnd::Empty,
             },
+            0,
             None,
         )?;
         Ok(Self {
@@ -688,6 +826,157 @@ fn reverse_undo_promotes_trims_and_returns_the_unique_writer() -> TestResult {
 }
 
 #[test]
+fn accepted_vlog_sync_failure_precedes_recovery_state_and_all_destructive_actions() -> TestResult {
+    let mut harness = Harness::new()?;
+    harness.put(b"stable", b"stable", true)?;
+    harness.put(b"accepted", b"accepted", false)?;
+    harness.put(b"rejected", b"rejected", false)?;
+    harness.finish_writes();
+
+    let baseline = harness.analyze()?;
+    harness.flip_value_byte(&baseline.descriptors[1])?;
+    let plan = harness.analyze()?;
+    assert_eq!(plan.accepted_seq, 2);
+    assert_eq!(plan.accepted_vlog_seq, 2);
+    assert!(plan.needs_undo && plan.needs_promote && plan.needs_trim);
+    let before_inventory = ManagedInventory::inspect(&harness.root, &harness.format)?;
+
+    let io = Arc::new(FailAcceptedSyncIo::default());
+    let error = match harness.execute(Arc::clone(&io) as Arc<dyn WriterIo>) {
+        Ok(_) => panic!("accepted-prefix sync failure must abort recovery"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind, StorageErrorKind::Io);
+    assert_eq!(error.operation, Operation::Open);
+    assert_eq!(error.protocol_stage, ProtocolStage::Recovery);
+    assert_eq!(io.file_syncs.load(Ordering::SeqCst), 1);
+    assert_eq!(io.directory_syncs.load(Ordering::SeqCst), 0);
+    assert_eq!(io.truncates.load(Ordering::SeqCst), 0);
+    assert_eq!(io.deletes.load(Ordering::SeqCst), 0);
+    assert!(
+        harness
+            .backend()
+            .get_internal(InternalIndexSpace::System, RECOVERY_STATE_KEY)?
+            .is_none()
+    );
+    let (head, frontier) = harness.head_and_frontier()?;
+    assert_eq!(
+        (head, frontier.durable_seq, frontier.durable_vlog_seq),
+        (3, 1, 1)
+    );
+    assert!(harness.backend().get_user(b"rejected", None)?.is_some());
+    assert!(
+        harness
+            .backend()
+            .get_internal(InternalIndexSpace::Transaction, &encode_tx_meta_key(3)?)?
+            .is_some()
+    );
+    assert_eq!(
+        ManagedInventory::inspect(&harness.root, &harness.format)?,
+        before_inventory
+    );
+    Ok(())
+}
+
+#[test]
+fn accepted_vlog_sync_completes_before_recovery_state_syncall_is_entered() -> TestResult {
+    let mut harness = Harness::new()?;
+    harness.put(b"stable", b"stable", true)?;
+    harness.put(b"accepted", b"accepted", false)?;
+    harness.put(b"rejected", b"rejected", false)?;
+    harness.finish_writes();
+    let baseline = harness.analyze()?;
+    harness.flip_value_byte(&baseline.descriptors[1])?;
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let backend = OrderedRecoveryBackend {
+        inner: Arc::clone(harness.backend()),
+        events: Arc::clone(&events),
+    };
+    let io = Arc::new(OrderedRecoveryIo {
+        events: Arc::clone(&events),
+    });
+    let (plan, reader, vlog) = harness.recovery_inputs(Arc::clone(&io) as Arc<dyn WriterIo>)?;
+    assert_eq!((plan.accepted_seq, plan.accepted_vlog_seq), (2, 2));
+    assert!(plan.needs_undo && plan.needs_trim);
+    let recovered = execute_recovery(
+        &backend,
+        plan,
+        &harness.root,
+        &harness.format,
+        &reader,
+        vlog,
+    )?;
+    assert_eq!(recovered.head_seq, 2);
+
+    let events = events.lock().expect("event mutex poisoned");
+    assert_eq!(
+        events.first(),
+        Some(&RecoveryOrderEvent::AcceptedFileSyncComplete)
+    );
+    assert_eq!(
+        events.get(1),
+        Some(&RecoveryOrderEvent::RecoveryStateCommitEntered)
+    );
+    Ok(())
+}
+
+#[test]
+fn existing_recovery_state_never_resyncs_its_fixed_accepted_vlog_prefix() -> TestResult {
+    let mut harness = Harness::new()?;
+    harness.put(b"stable", b"stable", true)?;
+    harness.put(b"accepted", b"accepted", false)?;
+    harness.put(b"rejected", b"rejected", false)?;
+    harness.finish_writes();
+    let baseline = harness.analyze()?;
+    let target_end = DurableVLogEnd::Position(baseline.descriptors[0].meta.vlog_end);
+    let DurableVLogEnd::Position(target) = target_end else {
+        unreachable!();
+    };
+    let boundary = harness
+        .vlog_path
+        .join(format!("D{:06}.data", target.file_id));
+    let file = OpenOptions::new().read(true).write(true).open(boundary)?;
+    file.set_len(target.offset)?;
+    file.sync_all()?;
+    harness.commit_mutations(vec![IndexMutation::PutInternal {
+        space: InternalIndexSpace::System,
+        key: RECOVERY_STATE_KEY.to_vec(),
+        value: RecoveryState {
+            phase: RecoveryPhase::Undo,
+            original_head: 3,
+            target_seq: 2,
+            target_vlog_seq: 2,
+            target_vlog_end: target_end,
+            next_undo_seq: 3,
+            trim_required: false,
+        }
+        .encode()?
+        .to_vec(),
+    }])?;
+
+    let io = Arc::new(RecoveryIo::default());
+    let recovered = harness.execute(Arc::clone(&io) as Arc<dyn WriterIo>)?;
+    assert_eq!(recovered.head_seq, 2);
+    assert_eq!(recovered.durable_frontier.durable_seq, 2);
+    assert_eq!(recovered.durable_frontier.durable_vlog_seq, 2);
+    assert_eq!(recovered.durable_frontier.durable_vlog_end, target_end);
+    assert_eq!(io.file_syncs.load(Ordering::SeqCst), 0);
+    assert_eq!(io.directory_syncs.load(Ordering::SeqCst), 0);
+    assert_eq!(io.truncates.load(Ordering::SeqCst), 0);
+    assert_eq!(io.deletes.load(Ordering::SeqCst), 0);
+    assert_eq!(harness.read_value(b"accepted")?, Some(b"accepted".to_vec()));
+    assert!(harness.backend().get_user(b"rejected", None)?.is_none());
+    assert!(
+        harness
+            .backend()
+            .get_internal(InternalIndexSpace::System, RECOVERY_STATE_KEY)?
+            .is_none()
+    );
+    Ok(())
+}
+
+#[test]
 fn after_state_mismatch_fails_closed_without_overwriting_user_state() -> TestResult {
     let mut harness = Harness::new()?;
     harness.put(b"key", b"stable", true)?;
@@ -802,6 +1091,7 @@ fn trim_truncates_boundary_deletes_higher_suffix_and_finalize_only_clears_state(
         phase: RecoveryPhase::Finalize,
         original_head: 1,
         target_seq: 1,
+        target_vlog_seq: 1,
         target_vlog_end: stable.accepted_end,
         next_undo_seq: 1,
         trim_required: false,

@@ -55,6 +55,7 @@ fn pointer_for_key(file_id: u32, record_offset: u32, key_len: u32, value_len: u1
 
 fn sample_meta(distinct_key_count: u64) -> TxMeta {
     TxMeta {
+        transaction_kind: TransactionKind::VLogEnvelope,
         commit_seq: 2,
         tx_uuid: TxUuid(sample_uuid()),
         prev_seq: 1,
@@ -104,14 +105,14 @@ fn recompute_descriptor_crc(
     mutations: &[EncodedMutation],
 ) {
     let mut crc = crc32c(b"RKDESC0");
-    crc = crc32c_append(crc, &meta_value[0..82]);
+    crc = crc32c_append(crc, &meta_value[0..83]);
     for mutation in mutations {
         let value_len = u32::try_from(mutation.value.len()).unwrap();
         crc = crc32c_append(crc, &mutation.key);
         crc = crc32c_append(crc, &value_len.to_le_bytes());
         crc = crc32c_append(crc, &mutation.value);
     }
-    meta_value[82..86].copy_from_slice(&crc.to_le_bytes());
+    meta_value[83..87].copy_from_slice(&crc.to_le_bytes());
 }
 
 fn rewrite_crc(bytes: &mut [u8], covered_len: usize, crc_offset: usize) {
@@ -406,6 +407,7 @@ fn tx_meta_v0_golden_round_trip_and_relations() {
     let mut expected = Vec::new();
     expected.extend_from_slice(b"RKTM");
     expected.extend_from_slice(&0_u16.to_le_bytes());
+    expected.push(TransactionKind::VLogEnvelope as u8);
     expected.extend_from_slice(&2_u64.to_le_bytes());
     expected.extend_from_slice(&sample_uuid());
     expected.extend_from_slice(&1_u64.to_le_bytes());
@@ -417,11 +419,11 @@ fn tx_meta_v0_golden_round_trip_and_relations() {
     expected.extend_from_slice(&2_u64.to_le_bytes());
     expected.extend_from_slice(&0x1122_3344_u32.to_le_bytes());
     expected.extend_from_slice(&0x5566_7788_u32.to_le_bytes());
-    assert_eq!(encoded.len(), 86);
+    assert_eq!(encoded.len(), 87);
     assert_eq!(encoded.as_slice(), expected);
     assert_eq!(decode_tx_meta(&encoded).unwrap(), meta);
 
-    assert_error_kind(decode_tx_meta(&encoded[..85]), StorageErrorKind::Corruption);
+    assert_error_kind(decode_tx_meta(&encoded[..86]), StorageErrorKind::Corruption);
     let mut too_long = encoded.to_vec();
     too_long.push(0);
     assert_error_kind(decode_tx_meta(&too_long), StorageErrorKind::Corruption);
@@ -435,8 +437,11 @@ fn tx_meta_v0_golden_round_trip_and_relations() {
         StorageErrorKind::IncompatibleFormat,
     );
     let mut damaged = encoded;
-    damaged[14..30].fill(0);
+    damaged[15..31].fill(0);
     assert_error_kind(decode_tx_meta(&damaged), StorageErrorKind::Corruption);
+    let mut unknown_kind = encoded;
+    unknown_kind[6] = 2;
+    assert_error_kind(decode_tx_meta(&unknown_kind), StorageErrorKind::Corruption);
 
     for invalid in [
         TxMeta {
@@ -466,6 +471,141 @@ fn tx_meta_v0_golden_round_trip_and_relations() {
     ] {
         assert_error_kind(encode_tx_meta(&invalid), StorageErrorKind::InvalidArgument);
     }
+}
+
+#[test]
+fn index_only_delete_tx_meta_requires_zero_vlog_fields() {
+    let zero = VLogPos {
+        file_id: 0,
+        offset: 0,
+    };
+    let meta = TxMeta {
+        transaction_kind: TransactionKind::IndexOnlyDelete,
+        vlog_begin: zero,
+        vlog_end: zero,
+        envelope_crc32c: 0,
+        ..sample_meta(1)
+    };
+    let encoded = encode_tx_meta(&meta).unwrap();
+    assert_eq!(encoded[6], TransactionKind::IndexOnlyDelete as u8);
+    assert_eq!(&encoded[39..63], &[0; 24]);
+    assert_eq!(&encoded[79..83], &[0; 4]);
+    assert_eq!(decode_tx_meta(&encoded).unwrap(), meta);
+
+    for invalid in [
+        TxMeta {
+            vlog_begin: VLogPos {
+                file_id: 1,
+                offset: 0,
+            },
+            ..meta.clone()
+        },
+        TxMeta {
+            vlog_begin: VLogPos {
+                file_id: 0,
+                offset: 1,
+            },
+            ..meta.clone()
+        },
+        TxMeta {
+            vlog_end: VLogPos {
+                file_id: 1,
+                offset: 0,
+            },
+            ..meta.clone()
+        },
+        TxMeta {
+            vlog_end: VLogPos {
+                file_id: 0,
+                offset: 1,
+            },
+            ..meta.clone()
+        },
+        TxMeta {
+            envelope_crc32c: 1,
+            ..meta.clone()
+        },
+    ] {
+        assert_error_kind(encode_tx_meta(&invalid), StorageErrorKind::InvalidArgument);
+    }
+}
+
+#[test]
+fn index_only_delete_descriptor_requires_absent_final_states() {
+    let zero = VLogPos {
+        file_id: 0,
+        offset: 0,
+    };
+    let meta = TxMeta {
+        transaction_kind: TransactionKind::IndexOnlyDelete,
+        vlog_begin: zero,
+        vlog_end: zero,
+        logical_op_count: 2,
+        distinct_key_count: 1,
+        envelope_crc32c: 0,
+        descriptor_crc32c: 0,
+        ..sample_meta(1)
+    };
+    let descriptor = TransactionDescriptor {
+        meta: meta.clone(),
+        mutations: vec![TxMutation {
+            user_key: b"deleted".to_vec(),
+            before_state: ValueState::Absent,
+            after_state: ValueState::Absent,
+        }],
+    };
+    let encoded = encode_descriptor(&descriptor).unwrap();
+    let refs = mutation_refs(&encoded);
+    let decoded = decode_descriptor(&encoded.meta_key, &encoded.meta_value, &refs).unwrap();
+    assert_eq!(
+        decoded.meta.transaction_kind,
+        TransactionKind::IndexOnlyDelete
+    );
+    assert_eq!(decoded.meta.vlog_begin, zero);
+    assert_eq!(decoded.meta.vlog_end, zero);
+    assert_eq!(decoded.meta.envelope_crc32c, 0);
+
+    for (field, offset) in [
+        ("vlog_begin.file_id", 39),
+        ("vlog_begin.offset", 43),
+        ("vlog_end.file_id", 51),
+        ("vlog_end.offset", 55),
+        ("envelope_crc32c", 79),
+    ] {
+        let mut damaged = encoded.clone();
+        damaged.meta_value[offset] = 1;
+        recompute_descriptor_crc(&mut damaged.meta_value, &damaged.mutations);
+        let damaged_refs = mutation_refs(&damaged);
+        let result = decode_descriptor(&damaged.meta_key, &damaged.meta_value, &damaged_refs);
+        assert_error_kind(result, StorageErrorKind::Corruption);
+        assert_eq!(damaged.meta_value[offset], 1, "failed to mutate {field}");
+    }
+
+    let invalid = TransactionDescriptor {
+        meta,
+        mutations: vec![TxMutation {
+            user_key: b"deleted".to_vec(),
+            before_state: ValueState::Absent,
+            after_state: ValueState::Present(pointer_for_key(7, 64, 7, 5)),
+        }],
+    };
+    assert_error_kind(
+        encode_descriptor(&invalid),
+        StorageErrorKind::InvalidArgument,
+    );
+
+    let mut invalid_encoded = encoded;
+    invalid_encoded.mutations[0].value = encode_tx_mutation(&invalid.mutations[0]).unwrap();
+    recompute_descriptor_crc(&mut invalid_encoded.meta_value, &invalid_encoded.mutations);
+    let invalid_refs = mutation_refs(&invalid_encoded);
+    assert_error_kind(
+        decode_descriptor(
+            &invalid_encoded.meta_key,
+            &invalid_encoded.meta_value,
+            &invalid_refs,
+        ),
+        StorageErrorKind::Corruption,
+    );
 }
 
 #[test]
@@ -562,9 +702,9 @@ fn descriptor_crc_and_whole_descriptor_validation_are_strict() {
         descriptor.meta.descriptor_crc32c
     );
 
-    let stored_crc = u32::from_le_bytes(encoded.meta_value[82..86].try_into().unwrap());
+    let stored_crc = u32::from_le_bytes(encoded.meta_value[83..87].try_into().unwrap());
     let mut expected_crc = crc32c(b"RKDESC0");
-    expected_crc = crc32c_append(expected_crc, &encoded.meta_value[0..82]);
+    expected_crc = crc32c_append(expected_crc, &encoded.meta_value[0..83]);
     for mutation in &encoded.mutations {
         expected_crc = crc32c_append(expected_crc, &mutation.key);
         expected_crc = crc32c_append(
@@ -574,7 +714,23 @@ fn descriptor_crc_and_whole_descriptor_validation_are_strict() {
         expected_crc = crc32c_append(expected_crc, &mutation.value);
     }
     assert_eq!(stored_crc, expected_crc);
-    assert_eq!(stored_crc, 0x1ba6_3062);
+    assert_eq!(stored_crc, 0x8d62_b04f);
+
+    let mut changed_kind_prefix = encoded.meta_value;
+    changed_kind_prefix[6] = TransactionKind::IndexOnlyDelete as u8;
+    assert_ne!(
+        crc32c_append(crc32c(b"RKDESC0"), &changed_kind_prefix[0..83]),
+        crc32c_append(crc32c(b"RKDESC0"), &encoded.meta_value[0..83])
+    );
+
+    for offset in 0..83 {
+        let mut damaged = encoded.meta_value;
+        damaged[offset] ^= 1;
+        assert!(
+            decode_descriptor(&encoded.meta_key, &damaged, &refs).is_err(),
+            "descriptor metadata byte {offset} was not covered"
+        );
+    }
 
     assert_error_kind(
         decode_descriptor(
@@ -753,26 +909,30 @@ fn head_seq_is_exact_little_endian_and_capacity_checked() {
 fn durable_frontier_v0_golden_crc_and_relations() {
     let empty = DurableFrontier {
         durable_seq: 0,
+        durable_vlog_seq: 0,
         durable_vlog_end: DurableVLogEnd::Empty,
     };
     let empty_encoded = empty.encode().unwrap();
+    assert_eq!(empty_encoded.len(), 39);
     assert_eq!(&empty_encoded[0..4], b"RKDF");
     assert_eq!(&empty_encoded[4..6], &[0, 0]);
     assert_eq!(&empty_encoded[6..14], &[0; 8]);
-    assert_eq!(empty_encoded[14], 0);
-    assert_eq!(&empty_encoded[15..27], &[0; 12]);
+    assert_eq!(&empty_encoded[14..22], &[0; 8]);
+    assert_eq!(empty_encoded[22], 0);
+    assert_eq!(&empty_encoded[23..35], &[0; 12]);
     assert_eq!(
-        u32::from_le_bytes(empty_encoded[27..31].try_into().unwrap()),
-        crc32c(&empty_encoded[0..27])
+        u32::from_le_bytes(empty_encoded[35..39].try_into().unwrap()),
+        crc32c(&empty_encoded[0..35])
     );
     assert_eq!(
-        u32::from_le_bytes(empty_encoded[27..31].try_into().unwrap()),
-        0xad40_0390
+        u32::from_le_bytes(empty_encoded[35..39].try_into().unwrap()),
+        0xe267_b96f
     );
     assert_eq!(DurableFrontier::decode(&empty_encoded).unwrap(), empty);
 
     let frontier = DurableFrontier {
         durable_seq: 5,
+        durable_vlog_seq: 5,
         durable_vlog_end: DurableVLogEnd::Position(VLogPos {
             file_id: 9,
             offset: 1_u64 << 32,
@@ -781,18 +941,36 @@ fn durable_frontier_v0_golden_crc_and_relations() {
     let encoded = frontier.encode().unwrap();
     assert_eq!(&encoded[0..4], b"RKDF");
     assert_eq!(&encoded[6..14], &5_u64.to_le_bytes());
-    assert_eq!(encoded[14], 1);
-    assert_eq!(&encoded[15..19], &9_u32.to_le_bytes());
-    assert_eq!(&encoded[19..27], &(1_u64 << 32).to_le_bytes());
+    assert_eq!(&encoded[14..22], &5_u64.to_le_bytes());
+    assert_eq!(encoded[22], 1);
+    assert_eq!(&encoded[23..27], &9_u32.to_le_bytes());
+    assert_eq!(&encoded[27..35], &(1_u64 << 32).to_le_bytes());
     assert_eq!(
-        u32::from_le_bytes(encoded[27..31].try_into().unwrap()),
-        0xc6e7_1855
+        u32::from_le_bytes(encoded[35..39].try_into().unwrap()),
+        0xaf40_de08
     );
     assert_eq!(DurableFrontier::decode(&encoded).unwrap(), frontier);
     frontier.validate_against_head(5).unwrap();
 
+    for offset in 0..35 {
+        let mut damaged = encoded;
+        damaged[offset] ^= 1;
+        assert!(
+            DurableFrontier::decode(&damaged).is_err(),
+            "durable frontier byte {offset} was not covered"
+        );
+    }
+    for offset in 35..39 {
+        let mut damaged = encoded;
+        damaged[offset] ^= 1;
+        assert_error_kind(
+            DurableFrontier::decode(&damaged),
+            StorageErrorKind::Corruption,
+        );
+    }
+
     assert_error_kind(
-        DurableFrontier::decode(&encoded[..30]),
+        DurableFrontier::decode(&encoded[..31]),
         StorageErrorKind::Corruption,
     );
     let mut too_long = encoded.to_vec();
@@ -802,7 +980,7 @@ fn durable_frontier_v0_golden_crc_and_relations() {
         StorageErrorKind::Corruption,
     );
     let mut damaged = encoded;
-    damaged[27] ^= 1;
+    damaged[35] ^= 1;
     assert_error_kind(
         DurableFrontier::decode(&damaged),
         StorageErrorKind::Corruption,
@@ -815,21 +993,21 @@ fn durable_frontier_v0_golden_crc_and_relations() {
     );
     let mut unknown_version = encoded;
     unknown_version[4..6].copy_from_slice(&1_u16.to_le_bytes());
-    rewrite_crc(&mut unknown_version, 27, 27);
+    rewrite_crc(&mut unknown_version, 35, 35);
     assert_error_kind(
         DurableFrontier::decode(&unknown_version),
         StorageErrorKind::IncompatibleFormat,
     );
     let mut unknown_tag = encoded;
-    unknown_tag[14] = 2;
-    rewrite_crc(&mut unknown_tag, 27, 27);
+    unknown_tag[22] = 2;
+    rewrite_crc(&mut unknown_tag, 35, 35);
     assert_error_kind(
         DurableFrontier::decode(&unknown_tag),
         StorageErrorKind::Corruption,
     );
     let mut nonzero_empty = empty_encoded;
-    nonzero_empty[15] = 1;
-    rewrite_crc(&mut nonzero_empty, 27, 27);
+    nonzero_empty[23] = 1;
+    rewrite_crc(&mut nonzero_empty, 35, 35);
     assert_error_kind(
         DurableFrontier::decode(&nonzero_empty),
         StorageErrorKind::Corruption,
@@ -837,7 +1015,45 @@ fn durable_frontier_v0_golden_crc_and_relations() {
     assert_error_kind(
         DurableFrontier {
             durable_seq: 0,
+            durable_vlog_seq: 0,
             durable_vlog_end: frontier.durable_vlog_end,
+        }
+        .encode(),
+        StorageErrorKind::InvalidArgument,
+    );
+    let index_only_frontier = DurableFrontier {
+        durable_seq: 5,
+        durable_vlog_seq: 0,
+        durable_vlog_end: DurableVLogEnd::Empty,
+    };
+    let encoded_index_only_frontier = index_only_frontier.encode().unwrap();
+    assert_eq!(
+        DurableFrontier::decode(&encoded_index_only_frontier).unwrap(),
+        index_only_frontier
+    );
+    let mixed_frontier = DurableFrontier {
+        durable_seq: 5,
+        durable_vlog_seq: 3,
+        durable_vlog_end: frontier.durable_vlog_end,
+    };
+    assert_eq!(
+        DurableFrontier::decode(&mixed_frontier.encode().unwrap()).unwrap(),
+        mixed_frontier
+    );
+    assert_error_kind(
+        DurableFrontier {
+            durable_seq: 4,
+            durable_vlog_seq: 5,
+            durable_vlog_end: frontier.durable_vlog_end,
+        }
+        .encode(),
+        StorageErrorKind::InvalidArgument,
+    );
+    assert_error_kind(
+        DurableFrontier {
+            durable_seq: 5,
+            durable_vlog_seq: 5,
+            durable_vlog_end: DurableVLogEnd::Empty,
         }
         .encode(),
         StorageErrorKind::InvalidArgument,
@@ -854,6 +1070,7 @@ fn recovery_state_v0_golden_crc_and_phase_invariants() {
         phase: RecoveryPhase::Undo,
         original_head: 10,
         target_seq: 5,
+        target_vlog_seq: 5,
         target_vlog_end: DurableVLogEnd::Position(VLogPos {
             file_id: 7,
             offset: 4096,
@@ -862,25 +1079,44 @@ fn recovery_state_v0_golden_crc_and_phase_invariants() {
         trim_required: true,
     };
     let encoded = state.encode().unwrap();
+    assert_eq!(encoded.len(), 57);
     assert_eq!(&encoded[0..4], b"RKRS");
     assert_eq!(&encoded[4..6], &[0, 0]);
     assert_eq!(encoded[6], 1);
     assert_eq!(&encoded[7..15], &10_u64.to_le_bytes());
     assert_eq!(&encoded[15..23], &5_u64.to_le_bytes());
-    assert_eq!(encoded[23], 1);
-    assert_eq!(&encoded[24..28], &7_u32.to_le_bytes());
-    assert_eq!(&encoded[28..36], &4096_u64.to_le_bytes());
-    assert_eq!(&encoded[36..44], &10_u64.to_le_bytes());
-    assert_eq!(encoded[44], 1);
+    assert_eq!(&encoded[23..31], &5_u64.to_le_bytes());
+    assert_eq!(encoded[31], 1);
+    assert_eq!(&encoded[32..36], &7_u32.to_le_bytes());
+    assert_eq!(&encoded[36..44], &4096_u64.to_le_bytes());
+    assert_eq!(&encoded[44..52], &10_u64.to_le_bytes());
+    assert_eq!(encoded[52], 1);
     assert_eq!(
-        u32::from_le_bytes(encoded[45..49].try_into().unwrap()),
-        crc32c(&encoded[0..45])
+        u32::from_le_bytes(encoded[53..57].try_into().unwrap()),
+        crc32c(&encoded[0..53])
     );
     assert_eq!(
-        u32::from_le_bytes(encoded[45..49].try_into().unwrap()),
-        0x6f7f_61f2
+        u32::from_le_bytes(encoded[53..57].try_into().unwrap()),
+        0x148a_73a1
     );
     assert_eq!(RecoveryState::decode(&encoded).unwrap(), state);
+
+    for offset in 0..53 {
+        let mut damaged = encoded;
+        damaged[offset] ^= 1;
+        assert!(
+            RecoveryState::decode(&damaged).is_err(),
+            "recovery state byte {offset} was not covered"
+        );
+    }
+    for offset in 53..57 {
+        let mut damaged = encoded;
+        damaged[offset] ^= 1;
+        assert_error_kind(
+            RecoveryState::decode(&damaged),
+            StorageErrorKind::Corruption,
+        );
+    }
 
     for valid in [
         RecoveryState {
@@ -898,8 +1134,18 @@ fn recovery_state_v0_golden_crc_and_phase_invariants() {
             phase: RecoveryPhase::Undo,
             original_head: 0,
             target_seq: 0,
+            target_vlog_seq: 0,
             target_vlog_end: DurableVLogEnd::Empty,
             next_undo_seq: 0,
+            trim_required: true,
+        },
+        RecoveryState {
+            phase: RecoveryPhase::Undo,
+            original_head: 5,
+            target_seq: 5,
+            target_vlog_seq: 0,
+            target_vlog_end: DurableVLogEnd::Empty,
+            next_undo_seq: 5,
             trim_required: true,
         },
     ] {
@@ -908,7 +1154,7 @@ fn recovery_state_v0_golden_crc_and_phase_invariants() {
     }
 
     assert_error_kind(
-        RecoveryState::decode(&encoded[..48]),
+        RecoveryState::decode(&encoded[..49]),
         StorageErrorKind::Corruption,
     );
     let mut too_long = encoded.to_vec();
@@ -918,7 +1164,7 @@ fn recovery_state_v0_golden_crc_and_phase_invariants() {
         StorageErrorKind::Corruption,
     );
     let mut damaged = encoded;
-    damaged[45] ^= 1;
+    damaged[53] ^= 1;
     assert_error_kind(
         RecoveryState::decode(&damaged),
         StorageErrorKind::Corruption,
@@ -931,23 +1177,23 @@ fn recovery_state_v0_golden_crc_and_phase_invariants() {
     );
     let mut unknown_version = encoded;
     unknown_version[4..6].copy_from_slice(&1_u16.to_le_bytes());
-    rewrite_crc(&mut unknown_version, 45, 45);
+    rewrite_crc(&mut unknown_version, 53, 53);
     assert_error_kind(
         RecoveryState::decode(&unknown_version),
         StorageErrorKind::IncompatibleFormat,
     );
-    for (offset, value) in [(6, 0), (6, 4), (44, 2)] {
+    for (offset, value) in [(6, 0), (6, 4), (52, 2)] {
         let mut damaged = encoded;
         damaged[offset] = value;
-        rewrite_crc(&mut damaged, 45, 45);
+        rewrite_crc(&mut damaged, 53, 53);
         assert_error_kind(
             RecoveryState::decode(&damaged),
             StorageErrorKind::Corruption,
         );
     }
     let mut unknown_end_tag = encoded;
-    unknown_end_tag[23] = 2;
-    rewrite_crc(&mut unknown_end_tag, 45, 45);
+    unknown_end_tag[31] = 2;
+    rewrite_crc(&mut unknown_end_tag, 53, 53);
     assert_error_kind(
         RecoveryState::decode(&unknown_end_tag),
         StorageErrorKind::Corruption,
@@ -964,6 +1210,18 @@ fn recovery_state_v0_golden_crc_and_phase_invariants() {
         },
         RecoveryState {
             target_seq: 0,
+            ..state
+        },
+        RecoveryState {
+            target_vlog_seq: 6,
+            ..state
+        },
+        RecoveryState {
+            target_vlog_seq: 0,
+            ..state
+        },
+        RecoveryState {
+            target_vlog_end: DurableVLogEnd::Empty,
             ..state
         },
         RecoveryState {

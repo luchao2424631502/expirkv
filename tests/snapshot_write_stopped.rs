@@ -191,8 +191,10 @@ impl Harness {
             0,
             DurableFrontier {
                 durable_seq: 0,
+                durable_vlog_seq: 0,
                 durable_vlog_end: DurableVLogEnd::Empty,
             },
+            0,
             None,
         )?;
         let db = Db::from_read_components(

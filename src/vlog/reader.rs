@@ -1,6 +1,8 @@
 //! Value Log positional reads, envelope scanning, and record validation.
 #![allow(dead_code)] // Stage 8 boundary; public reads are wired in later stages.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -17,6 +19,37 @@ pub(crate) struct ValueLogReader {
     geometry: VLogGeometry,
     #[cfg(test)]
     positioned_read: Option<Arc<dyn crate::vlog::file_set::PositionedRead>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct VLogReaderCallCounts {
+    pub(crate) value_dereference: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    static VLOG_READER_CALL_COUNTS: Cell<VLogReaderCallCounts> =
+        const { Cell::new(VLogReaderCallCounts { value_dereference: 0 }) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_vlog_reader_call_counts_for_test() {
+    VLOG_READER_CALL_COUNTS.with(|counts| counts.set(VLogReaderCallCounts::default()));
+}
+
+#[cfg(test)]
+pub(crate) fn vlog_reader_call_counts_for_test() -> VLogReaderCallCounts {
+    VLOG_READER_CALL_COUNTS.with(Cell::get)
+}
+
+#[cfg(test)]
+fn record_value_dereference_call() {
+    VLOG_READER_CALL_COUNTS.with(|counts| {
+        let mut updated = counts.get();
+        updated.value_dereference = updated.value_dereference.saturating_add(1);
+        counts.set(updated);
+    });
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -78,6 +111,8 @@ impl ValueLogReader {
         pointer: ValuePointer,
         expected_key: &[u8],
     ) -> Result<Vec<u8>> {
+        #[cfg(test)]
+        record_value_dereference_call();
         let pointer_offset = u64::from(pointer.record_offset);
         pointer
             .layout()

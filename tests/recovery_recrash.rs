@@ -54,7 +54,7 @@ mod recovery;
 
 use commit::{
     CommitCoordinator, DurableFrontier, DurableVLogEnd, RECOVERY_STATE_KEY, RecoveryPhase,
-    RecoveryState, TransactionDescriptor, TxUuidSource, ValueState, decode_head_seq,
+    RecoveryState, TransactionDescriptor, TxMutation, TxUuidSource, ValueState, decode_head_seq,
     encode_tx_meta_key, preflight_put,
 };
 use db::ManagedInventory;
@@ -412,8 +412,10 @@ impl Harness {
             0,
             DurableFrontier {
                 durable_seq: 0,
+                durable_vlog_seq: 0,
                 durable_vlog_end: DurableVLogEnd::Empty,
             },
+            0,
             None,
         )?;
         Ok(Self {
@@ -542,6 +544,70 @@ impl Harness {
         }])
     }
 
+    fn install_index_only(
+        &self,
+        commit_seq: u64,
+        logical_op_count: u64,
+        mutations: Vec<TxMutation>,
+    ) -> TestResult {
+        let encoded = TransactionDescriptor::encode_index_only_delete_for_test(
+            commit_seq,
+            [u8::try_from(commit_seq).unwrap_or(0xfe); 16],
+            logical_op_count,
+            mutations.clone(),
+        )?;
+        let capacity = mutations
+            .len()
+            .checked_add(encoded.mutations.len())
+            .and_then(|count| count.checked_add(2))
+            .ok_or_else(|| io::Error::other("index-only batch capacity overflow"))?;
+        let mut batch = IndexAtomicBatch::try_with_capacity(capacity)
+            .map_err(|error| io::Error::other(format!("index-only batch: {error:?}")))?;
+        for mutation in mutations {
+            assert_eq!(mutation.after_state, ValueState::Absent);
+            batch
+                .try_push(IndexMutation::DeleteUser {
+                    user_key: mutation.user_key,
+                })
+                .map_err(|error| io::Error::other(format!("delete user: {error:?}")))?;
+        }
+        batch
+            .try_push(IndexMutation::PutInternal {
+                space: InternalIndexSpace::Transaction,
+                key: encoded.meta_key.to_vec(),
+                value: encoded.meta_value.to_vec(),
+            })
+            .map_err(|error| io::Error::other(format!("put TxMeta: {error:?}")))?;
+        for mutation in encoded.mutations {
+            batch
+                .try_push(IndexMutation::PutInternal {
+                    space: InternalIndexSpace::Transaction,
+                    key: mutation.key.to_vec(),
+                    value: mutation.value,
+                })
+                .map_err(|error| io::Error::other(format!("put TxMutation: {error:?}")))?;
+        }
+        batch
+            .try_push(IndexMutation::PutInternal {
+                space: InternalIndexSpace::System,
+                key: HEAD_SEQ_KEY.to_vec(),
+                value: commit_seq.to_le_bytes().to_vec(),
+            })
+            .map_err(|error| io::Error::other(format!("put HeadSeq: {error:?}")))?;
+        self.backend()
+            .commit_atomic(batch, IndexCommitMode::SyncAll)
+            .map_err(|error| io::Error::other(format!("index-only commit: {error:?}")))?;
+        Ok(())
+    }
+
+    fn pointer(&self, key: &[u8]) -> TestResult<ValuePointer> {
+        let encoded = self
+            .backend()
+            .get_user(key, None)?
+            .ok_or_else(|| io::Error::other("pointer missing"))?;
+        Ok(ValuePointer::decode(&encoded)?)
+    }
+
     fn flip_value_byte(&self, descriptor: &TransactionDescriptor) -> TestResult {
         let pointer = descriptor
             .mutations
@@ -658,6 +724,240 @@ fn prepare_rejected_suffix() -> TestResult<(Harness, recovery::RecoveryPlan)> {
     );
     assert!(plan.needs_undo && plan.needs_promote && plan.needs_trim);
     Ok((harness, plan))
+}
+
+fn absent_delete(key: &[u8]) -> TxMutation {
+    TxMutation {
+        user_key: key.to_vec(),
+        before_state: ValueState::Absent,
+        after_state: ValueState::Absent,
+    }
+}
+
+fn prepare_index_only_undo_suffix() -> TestResult<(Harness, ValuePointer)> {
+    let mut harness = Harness::new()?;
+    harness.put(b"victim", b"unstable", false)?;
+    let pointer = harness.pointer(b"victim")?;
+    harness.finish_writes();
+    harness.install_index_only(
+        2,
+        1,
+        vec![TxMutation {
+            user_key: b"victim".to_vec(),
+            before_state: ValueState::Present(pointer),
+            after_state: ValueState::Absent,
+        }],
+    )?;
+    let valid = harness.analyze()?;
+    harness.flip_value_byte(&valid.descriptors[0])?;
+    let rejected = harness.analyze()?;
+    assert_eq!((rejected.accepted_seq, rejected.accepted_vlog_seq), (0, 0));
+    assert!(rejected.needs_undo && rejected.needs_trim);
+    harness.install_state(RecoveryState {
+        phase: RecoveryPhase::Undo,
+        original_head: 2,
+        target_seq: 0,
+        target_vlog_seq: 0,
+        target_vlog_end: DurableVLogEnd::Empty,
+        next_undo_seq: 2,
+        trim_required: true,
+    })?;
+    Ok((harness, pointer))
+}
+
+#[test]
+fn index_only_undo_batch_recrash_is_atomic_and_reopen_converges() -> TestResult {
+    for (crash, expected_head) in [(CommitCrash::Before(1), 2), (CommitCrash::After(1), 1)] {
+        let (mut harness, pointer) = prepare_index_only_undo_suffix()?;
+        let crashing = CrashBackend::new(Arc::clone(harness.backend()), crash);
+        let error = match harness.execute_with(&crashing, Arc::new(CrashIo::normal())) {
+            Ok(_) => panic!("IndexOnlyDelete Undo crash must stop Open"),
+            Err(error) => error,
+        };
+        assert_recovery_failure(&error);
+        let state = harness.state()?.expect("Undo state remains");
+        assert_eq!(state.phase, RecoveryPhase::Undo);
+        assert_eq!(state.next_undo_seq, expected_head);
+        assert_eq!(harness.head_and_frontier()?.0, expected_head);
+        match expected_head {
+            2 => assert!(harness.backend().get_user(b"victim", None)?.is_none()),
+            1 => assert_eq!(
+                harness.backend().get_user(b"victim", None)?.as_deref(),
+                Some(pointer.encode()?.as_slice())
+            ),
+            _ => unreachable!(),
+        }
+
+        drop(crashing);
+        harness.reopen_backend()?;
+        let recovered = harness.execute_normal()?;
+        assert_eq!(recovered.head_seq, 0);
+        assert_eq!(recovered.durable_frontier.durable_seq, 0);
+        assert_eq!(recovered.durable_frontier.durable_vlog_seq, 0);
+        assert!(harness.backend().get_user(b"victim", None)?.is_none());
+        assert!(harness.state()?.is_none());
+        assert!(
+            ManagedInventory::inspect(&harness.root, &harness.format)?
+                .vlog_files
+                .is_empty()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn index_only_frontier_and_finalize_commit_recrashes_preserve_c_greater_than_cf() -> TestResult {
+    for crash in [
+        CommitCrash::Before(1),
+        CommitCrash::After(1),
+        CommitCrash::Before(2),
+        CommitCrash::After(2),
+    ] {
+        let mut harness = Harness::new()?;
+        harness.finish_writes();
+        harness.install_index_only(1, 1, vec![absent_delete(b"missing-a")])?;
+        harness.install_index_only(2, 1, vec![absent_delete(b"missing-b")])?;
+        harness.install_state(RecoveryState {
+            phase: RecoveryPhase::Undo,
+            original_head: 2,
+            target_seq: 2,
+            target_vlog_seq: 0,
+            target_vlog_end: DurableVLogEnd::Empty,
+            next_undo_seq: 2,
+            trim_required: false,
+        })?;
+
+        let crashing = CrashBackend::new(Arc::clone(harness.backend()), crash);
+        let error = match harness.execute_with(&crashing, Arc::new(CrashIo::normal())) {
+            Ok(_) => panic!("IndexOnlyDelete frontier/finalize crash must stop Open"),
+            Err(error) => error,
+        };
+        assert_recovery_failure(&error);
+        let (_, frontier) = harness.head_and_frontier()?;
+        match crash {
+            CommitCrash::Before(1) => {
+                assert_eq!(frontier.durable_seq, 0);
+                assert_eq!(
+                    harness.state()?.expect("Undo state").phase,
+                    RecoveryPhase::Undo
+                );
+            }
+            CommitCrash::After(1) | CommitCrash::Before(2) => {
+                assert_eq!(frontier.durable_seq, 2);
+                assert_eq!(
+                    harness.state()?.expect("Finalize state").phase,
+                    RecoveryPhase::Finalize
+                );
+            }
+            CommitCrash::After(2) => {
+                assert_eq!(frontier.durable_seq, 2);
+                assert!(harness.state()?.is_none());
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(frontier.durable_vlog_seq, 0);
+        assert_eq!(frontier.durable_vlog_end, DurableVLogEnd::Empty);
+
+        drop(crashing);
+        harness.reopen_backend()?;
+        let recovered = harness.execute_normal()?;
+        assert_eq!(recovered.head_seq, 2);
+        assert_eq!(recovered.durable_frontier.durable_seq, 2);
+        assert_eq!(recovered.durable_frontier.durable_vlog_seq, 0);
+        assert_eq!(
+            recovered.durable_frontier.durable_vlog_end,
+            DurableVLogEnd::Empty
+        );
+        assert!(harness.state()?.is_none());
+    }
+    Ok(())
+}
+
+#[test]
+fn trailing_index_only_trim_commit_recrashes_keep_position_target_and_converge() -> TestResult {
+    for crash in [
+        CommitCrash::Before(1),
+        CommitCrash::After(1),
+        CommitCrash::Before(2),
+        CommitCrash::After(2),
+    ] {
+        let mut harness = Harness::new()?;
+        harness.put(b"stable", b"value", true)?;
+        harness.finish_writes();
+        let stable = harness.analyze()?;
+        let DurableVLogEnd::Position(end) = stable.accepted_end else {
+            panic!("stable Put must have a VLog end");
+        };
+        harness.install_index_only(2, 1, vec![absent_delete(b"missing")])?;
+        let boundary = harness.vlog_path.join(format!("D{:06}.data", end.file_id));
+        OpenOptions::new()
+            .write(true)
+            .open(&boundary)?
+            .set_len(end.offset + 17)?;
+        harness.install_state(RecoveryState {
+            phase: RecoveryPhase::Undo,
+            original_head: 2,
+            target_seq: 2,
+            target_vlog_seq: 1,
+            target_vlog_end: stable.accepted_end,
+            next_undo_seq: 2,
+            trim_required: true,
+        })?;
+
+        let crashing = CrashBackend::new(Arc::clone(harness.backend()), crash);
+        let error = match harness.execute_with(&crashing, Arc::new(CrashIo::normal())) {
+            Ok(_) => panic!("trailing IndexOnlyDelete Trim crash must stop Open"),
+            Err(error) => error,
+        };
+        assert_recovery_failure(&error);
+        let (_, frontier) = harness.head_and_frontier()?;
+        match crash {
+            CommitCrash::Before(1) => {
+                assert_eq!((frontier.durable_seq, frontier.durable_vlog_seq), (1, 1));
+                assert_eq!(
+                    harness.state()?.expect("Undo state").phase,
+                    RecoveryPhase::Undo
+                );
+                assert_eq!(std::fs::metadata(&boundary)?.len(), end.offset + 17);
+            }
+            CommitCrash::After(1) => {
+                assert_eq!((frontier.durable_seq, frontier.durable_vlog_seq), (2, 1));
+                assert_eq!(
+                    harness.state()?.expect("Trim state").phase,
+                    RecoveryPhase::Trim
+                );
+                assert_eq!(std::fs::metadata(&boundary)?.len(), end.offset + 17);
+            }
+            CommitCrash::Before(2) => {
+                assert_eq!((frontier.durable_seq, frontier.durable_vlog_seq), (2, 1));
+                assert_eq!(
+                    harness.state()?.expect("Trim state").phase,
+                    RecoveryPhase::Trim
+                );
+                assert_eq!(std::fs::metadata(&boundary)?.len(), end.offset);
+            }
+            CommitCrash::After(2) => {
+                assert_eq!((frontier.durable_seq, frontier.durable_vlog_seq), (2, 1));
+                assert!(harness.state()?.is_none());
+                assert_eq!(std::fs::metadata(&boundary)?.len(), end.offset);
+            }
+            _ => unreachable!(),
+        }
+
+        drop(crashing);
+        harness.reopen_backend()?;
+        let recovered = harness.execute_normal()?;
+        assert_eq!(recovered.head_seq, 2);
+        assert_eq!(recovered.durable_frontier.durable_seq, 2);
+        assert_eq!(recovered.durable_frontier.durable_vlog_seq, 1);
+        assert_eq!(
+            recovered.durable_frontier.durable_vlog_end,
+            stable.accepted_end
+        );
+        assert_eq!(std::fs::metadata(&boundary)?.len(), end.offset);
+        assert!(harness.state()?.is_none());
+    }
+    Ok(())
 }
 
 #[test]
@@ -790,6 +1090,7 @@ fn every_undo_batch_is_atomic_and_reopen_resumes_at_the_persisted_sequence() -> 
             phase: RecoveryPhase::Undo,
             original_head: 4,
             target_seq: 2,
+            target_vlog_seq: 2,
             target_vlog_end: plan.accepted_end,
             next_undo_seq: 4,
             trim_required: true,
@@ -849,6 +1150,7 @@ fn frontier_and_finalize_commit_boundaries_resume_without_guessing() -> TestResu
             phase: RecoveryPhase::Undo,
             original_head: 2,
             target_seq: 2,
+            target_vlog_seq: 2,
             target_vlog_end: plan.accepted_end,
             next_undo_seq: 2,
             trim_required: false,
@@ -892,6 +1194,7 @@ fn frontier_and_finalize_commit_boundaries_resume_without_guessing() -> TestResu
             phase: RecoveryPhase::Finalize,
             original_head: 1,
             target_seq: 1,
+            target_vlog_seq: 1,
             target_vlog_end: plan.accepted_end,
             next_undo_seq: 1,
             trim_required: false,
@@ -986,6 +1289,7 @@ fn prepared_trim_state() -> TestResult<Harness> {
         phase: RecoveryPhase::Trim,
         original_head: 1,
         target_seq: 1,
+        target_vlog_seq: 1,
         target_vlog_end: plan.accepted_end,
         next_undo_seq: 1,
         trim_required: true,

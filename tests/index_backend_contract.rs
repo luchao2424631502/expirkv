@@ -397,6 +397,7 @@ fn encoded_initial_metadata() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let head_seq = descriptor::encode_head_seq(0).to_vec();
     let frontier = descriptor::DurableFrontier {
         durable_seq: 0,
+        durable_vlog_seq: 0,
         durable_vlog_end: descriptor::DurableVLogEnd::Empty,
     }
     .encode()
@@ -592,6 +593,7 @@ fn initialization_rejects_noncanonical_metadata_before_commit() {
             encoded_head_seq.clone(),
             descriptor::DurableFrontier {
                 durable_seq: 1,
+                durable_vlog_seq: 1,
                 durable_vlog_end: descriptor::DurableVLogEnd::Position(descriptor::VLogPos {
                     file_id: 0,
                     offset: 64,

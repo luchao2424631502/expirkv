@@ -1,6 +1,8 @@
 //! Value Log append, page transition, file rolling, and synchronization.
 #![allow(dead_code)] // Stage 8 boundary; the coordinator is wired in later stages.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::File;
 use std::io;
@@ -83,6 +85,48 @@ pub(crate) enum AppendStateSnapshot {
     Empty,
     Open { file_id: u32, offset: u64 },
     AtFileLimit { last_file_id: u32 },
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct VLogWriterCallCounts {
+    pub(crate) append: u64,
+    pub(crate) file_create: u64,
+    pub(crate) file_roll: u64,
+    pub(crate) file_sync: u64,
+    pub(crate) directory_sync: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    static VLOG_WRITER_CALL_COUNTS: Cell<VLogWriterCallCounts> = const {
+        Cell::new(VLogWriterCallCounts {
+            append: 0,
+            file_create: 0,
+            file_roll: 0,
+            file_sync: 0,
+            directory_sync: 0,
+        })
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_vlog_writer_call_counts_for_test() {
+    VLOG_WRITER_CALL_COUNTS.with(|counts| counts.set(VLogWriterCallCounts::default()));
+}
+
+#[cfg(test)]
+pub(crate) fn vlog_writer_call_counts_for_test() -> VLogWriterCallCounts {
+    VLOG_WRITER_CALL_COUNTS.with(Cell::get)
+}
+
+#[cfg(test)]
+fn record_writer_call(update: impl FnOnce(&mut VLogWriterCallCounts)) {
+    VLOG_WRITER_CALL_COUNTS.with(|counts| {
+        let mut updated = counts.get();
+        update(&mut updated);
+        counts.set(updated);
+    });
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -452,6 +496,25 @@ impl ValueLogWriter {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn open_with_io(
+        directory: Arc<VLogDirectory>,
+        database_uuid: [u8; 16],
+        geometry: VLogGeometry,
+        catalog: Arc<FileCatalog>,
+        accepted_end: Option<VLogPosition>,
+        io: Arc<dyn WriterIo>,
+    ) -> Result<Self> {
+        Self::open_inner(
+            directory,
+            database_uuid,
+            geometry,
+            catalog,
+            accepted_end,
+            io,
+        )
+    }
+
     fn open_inner(
         directory: Arc<VLogDirectory>,
         database_uuid: [u8; 16],
@@ -570,6 +633,8 @@ impl ValueLogWriter {
     }
 
     pub(crate) fn append(&mut self, envelope: &PreparedEnvelope) -> Result<()> {
+        #[cfg(test)]
+        record_writer_call(|counts| counts.append = counts.append.saturating_add(1));
         if self.append_failed {
             return Err(writer_stopped(envelope.commit_seq, envelope.vlog_begin));
         }
@@ -680,6 +745,10 @@ impl ValueLogWriter {
             }
         }
         if !directory_entries.is_empty() {
+            #[cfg(test)]
+            record_writer_call(|counts| {
+                counts.directory_sync = counts.directory_sync.saturating_add(1);
+            });
             if let Err(error) = self
                 .io
                 .sync_directory(&self.directory)
@@ -918,6 +987,18 @@ impl ValueLogWriter {
         {
             return Err(append_layout(position.file_id, position.offset));
         }
+        #[cfg(test)]
+        match &previous_state {
+            AppendState::Empty => record_writer_call(|counts| {
+                counts.file_create = counts.file_create.saturating_add(1);
+            }),
+            AppendState::AtFileLimit { .. } => record_writer_call(|counts| {
+                counts.file_roll = counts.file_roll.saturating_add(1);
+            }),
+            AppendState::Open { .. } => {
+                unreachable!("an open VLog file is never replaced during ensure")
+            }
+        }
         let file = self
             .directory
             .create_new(&self.file_capability, file_id)
@@ -970,6 +1051,10 @@ impl ValueLogWriter {
         } = &self.state
         {
             if *active_id == file_id {
+                #[cfg(test)]
+                record_writer_call(|counts| {
+                    counts.file_sync = counts.file_sync.saturating_add(1);
+                });
                 return self.io.sync_file(file).map_err(|error| {
                     sync_file_io(target_seq, file_id, Some(self.position().offset), error)
                 });
@@ -983,6 +1068,10 @@ impl ValueLogWriter {
         self.catalog
             .verify(file_id, &file)
             .map_err(|error| sync_context(error, target_seq, Some(self.position()), file_id))?;
+        #[cfg(test)]
+        record_writer_call(|counts| {
+            counts.file_sync = counts.file_sync.saturating_add(1);
+        });
         self.io
             .sync_file(&file)
             .map_err(|error| sync_file_io(target_seq, file_id, None, error))

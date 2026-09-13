@@ -13,7 +13,9 @@ use crate::{
     WriteOutcome,
 };
 
-use super::descriptor::{CommitSeq, DurableFrontier, DurableVLogEnd, TxUuid, VLogPos};
+use super::descriptor::{
+    CommitSeq, DurableFrontier, DurableVLogEnd, TransactionKind, TxUuid, VLogPos,
+};
 use super::durability::{DurabilityCoordinator, add_frontier_to_batch, frontier_only_batch};
 use super::protocol::{TxUuidSource, ValidatedWrite, prepare_commit};
 
@@ -21,6 +23,8 @@ use super::protocol::{TxUuidSource, ValidatedWrite, prepare_commit};
 pub(crate) struct CommitStateSnapshot {
     pub(crate) head_seq: CommitSeq,
     pub(crate) durable_seq: CommitSeq,
+    pub(crate) head_vlog_seq: CommitSeq,
+    pub(crate) durable_vlog_seq: CommitSeq,
     pub(crate) head_vlog_end: Option<VLogPosition>,
     pub(crate) durable_vlog_end: Option<VLogPosition>,
 }
@@ -29,6 +33,7 @@ pub(crate) struct CommitStateSnapshot {
 struct CommitState {
     head_seq: CommitSeq,
     durable_frontier: DurableFrontier,
+    head_vlog_seq: CommitSeq,
     head_vlog_end: Option<VLogPosition>,
 }
 
@@ -55,9 +60,16 @@ where
         uuid_source: U,
         head_seq: CommitSeq,
         durable_frontier: DurableFrontier,
+        head_vlog_seq: CommitSeq,
         head_vlog_end: Option<VLogPosition>,
     ) -> Result<Self> {
-        validate_initial_state(head_seq, durable_frontier, head_vlog_end, &writer)?;
+        validate_initial_state(
+            head_seq,
+            durable_frontier,
+            head_vlog_seq,
+            head_vlog_end,
+            &writer,
+        )?;
         let coordinator = Self {
             runtime,
             stats,
@@ -67,6 +79,7 @@ where
             state: Mutex::new(CommitState {
                 head_seq,
                 durable_frontier,
+                head_vlog_seq,
                 head_vlog_end,
             }),
             durability: DurabilityCoordinator::new(),
@@ -116,14 +129,19 @@ where
         let operation = write.public_operation();
         let ticket = self.start_request(operation)?;
         let state = *lock(&self.state);
-        let mut writer = lock(&self.writer);
+        let transaction_kind = write.transaction_kind();
+        let mut writer = match transaction_kind {
+            TransactionKind::VLogEnvelope => Some(lock(&self.writer)),
+            TransactionKind::IndexOnlyDelete => None,
+        };
+        let vlog_context = writer
+            .as_ref()
+            .map(|writer| (writer.database_uuid(), writer.position(), writer.geometry()));
         let mut uuid_source = lock(&self.uuid_source);
         let preparation = prepare_commit(
             write,
-            writer.database_uuid(),
             state.head_seq,
-            writer.position(),
-            writer.geometry(),
+            vlog_context,
             self.index.as_ref(),
             &mut *uuid_source,
         );
@@ -136,7 +154,14 @@ where
             }
         };
 
-        let frontier = sync.then(|| frontier_for(prepared.commit_seq, prepared.envelope.vlog_end));
+        debug_assert_eq!(prepared.transaction_kind, transaction_kind);
+        let (target_vlog_seq, target_vlog_end) = match &prepared.envelope {
+            Some(envelope) => (prepared.commit_seq, Some(envelope.vlog_end)),
+            None => (state.head_vlog_seq, state.head_vlog_end),
+        };
+
+        let frontier = sync
+            .then(|| frontier_from_optional(prepared.commit_seq, target_vlog_seq, target_vlog_end));
         if let Some(frontier) = frontier
             && let Err(error) =
                 add_frontier_to_batch(&mut prepared.index_batch, frontier, operation)
@@ -147,21 +172,34 @@ where
 
         let commit_seq = prepared.commit_seq;
         let tx_uuid = prepared.tx_uuid;
-        let vlog_end = prepared.envelope.vlog_end;
-        if let Err(error) = writer.append(&prepared.envelope) {
-            let error = remap_writer_operation(error, operation);
-            let target = classify_vlog_append_failure(&error, writer.has_terminal_failure());
-            drop(writer);
-            return Err(self.fail_started(
-                ticket,
-                error,
-                Some(target),
-                Some((commit_seq, tx_uuid)),
-            ));
+        if let Some(envelope) = &prepared.envelope {
+            let append_result = {
+                let active_writer = writer
+                    .as_mut()
+                    .expect("VLogEnvelope preparation retains the writer");
+                active_writer
+                    .append(envelope)
+                    .map_err(|error| (error, active_writer.has_terminal_failure()))
+            };
+            if let Err((error, terminal)) = append_result {
+                let error = remap_writer_operation(error, operation);
+                let target = classify_vlog_append_failure(&error, terminal);
+                drop(writer);
+                return Err(self.fail_started(
+                    ticket,
+                    error,
+                    Some(target),
+                    Some((commit_seq, tx_uuid)),
+                ));
+            }
         }
 
-        let synced = if sync {
-            match writer.sync_through(commit_seq, Some(vlog_end)) {
+        let needs_vlog_sync = sync && target_vlog_seq > state.durable_frontier.durable_vlog_seq;
+        let synced = if needs_vlog_sync {
+            let sync_result = writer
+                .get_or_insert_with(|| lock(&self.writer))
+                .sync_through(target_vlog_seq, target_vlog_end);
+            match sync_result {
                 Ok(synced) => Some(synced),
                 Err(error) => {
                     let error = remap_writer_operation(error, operation);
@@ -186,16 +224,31 @@ where
         match self.index.commit_atomic(prepared.index_batch, mode) {
             Ok(()) => {
                 if let Some(synced) = synced {
-                    self.finish_frontier_after_success(&mut writer, synced, operation);
+                    self.finish_frontier_after_success(
+                        writer
+                            .as_mut()
+                            .expect("a completed VLog sync retains the writer"),
+                        synced,
+                        operation,
+                    );
                 }
                 drop(writer);
-                self.publish_nonempty_success(commit_seq, vlog_end, frontier);
+                self.publish_nonempty_success(
+                    commit_seq,
+                    transaction_kind,
+                    target_vlog_seq,
+                    target_vlog_end,
+                    frontier,
+                );
                 let _ = ticket.finish();
                 Ok(())
             }
             Err(error) => {
                 if let Some(synced) = synced {
-                    let _ = writer.frontier_failed(synced);
+                    let _ = writer
+                        .as_mut()
+                        .expect("a failed VLog-backed frontier retains the writer")
+                        .frontier_failed(synced);
                 }
                 let (storage_error, target) = map_index_commit_error(
                     error,
@@ -216,25 +269,48 @@ where
             return Ok(());
         }
         let target_end = captured.head_vlog_end;
-        let frontier = frontier_from_optional(captured.head_seq, target_end);
+        let frontier =
+            frontier_from_optional(captured.head_seq, captured.head_vlog_seq, target_end);
         let batch = match frontier_only_batch(frontier, Operation::WriteBatch) {
             Ok(batch) => batch,
             Err(error) => return Err(self.fail_started(ticket, error, None, None)),
         };
 
-        let mut writer = lock(&self.writer);
-        let synced = match writer.sync_through(captured.head_seq, target_end) {
-            Ok(synced) => synced,
-            Err(error) => {
-                let error = remap_writer_operation(error, Operation::WriteBatch);
-                drop(writer);
-                return Err(self.fail_started(ticket, error, Some(InstanceState::Poisoned), None));
+        let needs_vlog_sync = captured.head_vlog_seq > captured.durable_frontier.durable_vlog_seq;
+        let mut writer = needs_vlog_sync.then(|| lock(&self.writer));
+        let synced = if writer.is_some() {
+            let sync_result = writer
+                .as_mut()
+                .expect("VLog sync decision retains the writer")
+                .sync_through(captured.head_vlog_seq, target_end);
+            match sync_result {
+                Ok(synced) => Some(synced),
+                Err(error) => {
+                    let error = remap_writer_operation(error, Operation::WriteBatch);
+                    drop(writer);
+                    return Err(self.fail_started(
+                        ticket,
+                        error,
+                        Some(InstanceState::Poisoned),
+                        None,
+                    ));
+                }
             }
+        } else {
+            None
         };
 
         let current_durable = lock(&self.state).durable_frontier.durable_seq;
         if current_durable >= captured.head_seq {
-            self.finish_frontier_after_success(&mut writer, synced, Operation::WriteBatch);
+            if let Some(synced) = synced {
+                self.finish_frontier_after_success(
+                    writer
+                        .as_mut()
+                        .expect("a completed VLog sync retains the writer"),
+                    synced,
+                    Operation::WriteBatch,
+                );
+            }
             drop(writer);
             let _ = ticket.finish();
             return Ok(());
@@ -242,14 +318,27 @@ where
 
         match self.index.commit_atomic(batch, IndexCommitMode::SyncAll) {
             Ok(()) => {
-                self.finish_frontier_after_success(&mut writer, synced, Operation::WriteBatch);
+                if let Some(synced) = synced {
+                    self.finish_frontier_after_success(
+                        writer
+                            .as_mut()
+                            .expect("a completed VLog sync retains the writer"),
+                        synced,
+                        Operation::WriteBatch,
+                    );
+                }
                 drop(writer);
                 self.publish_empty_barrier_success(frontier);
                 let _ = ticket.finish();
                 Ok(())
             }
             Err(error) => {
-                let _ = writer.frontier_failed(synced);
+                if let Some(synced) = synced {
+                    let _ = writer
+                        .as_mut()
+                        .expect("a failed VLog-backed frontier retains the writer")
+                        .frontier_failed(synced);
+                }
                 let (storage_error, target) = map_index_commit_error(
                     error,
                     Operation::WriteBatch,
@@ -285,13 +374,18 @@ where
     fn publish_nonempty_success(
         &self,
         commit_seq: CommitSeq,
-        vlog_end: VLogPosition,
+        transaction_kind: TransactionKind,
+        target_vlog_seq: CommitSeq,
+        target_vlog_end: Option<VLogPosition>,
         frontier: Option<DurableFrontier>,
     ) {
         {
             let mut state = lock(&self.state);
             state.head_seq = commit_seq;
-            state.head_vlog_end = Some(vlog_end);
+            if transaction_kind == TransactionKind::VLogEnvelope {
+                state.head_vlog_seq = target_vlog_seq;
+                state.head_vlog_end = target_vlog_end;
+            }
             if let Some(frontier) = frontier {
                 state.durable_frontier = frontier;
             }
@@ -355,6 +449,7 @@ where
 fn validate_initial_state(
     head_seq: CommitSeq,
     frontier: DurableFrontier,
+    head_vlog_seq: CommitSeq,
     head_vlog_end: Option<VLogPosition>,
     writer: &ValueLogWriter,
 ) -> Result<()> {
@@ -362,20 +457,22 @@ fn validate_initial_state(
         .validate_against_head(head_seq)
         .map_err(|_| initial_state_error())?;
     let durable_end = descriptor_end_to_format(frontier.durable_vlog_end);
-    let valid_empty = head_seq == 0
-        && head_vlog_end.is_none()
-        && frontier.durable_seq == 0
-        && durable_end.is_none()
-        && writer.position()
-            == VLogPosition {
-                file_id: 0,
-                offset: 0,
-            };
-    let valid_nonempty = head_seq > 0
-        && frontier.durable_seq == head_seq
-        && head_vlog_end == Some(writer.position())
+    let valid_logical_frontier = frontier.durable_seq == head_seq
+        && frontier.durable_vlog_seq == head_vlog_seq
+        && head_vlog_seq <= head_seq
         && durable_end == head_vlog_end;
-    if writer.database_uuid() == [0; 16] || !(valid_empty || valid_nonempty) {
+    let valid_vlog_frontier = match (head_vlog_seq, head_vlog_end) {
+        (0, None) => {
+            writer.position()
+                == VLogPosition {
+                    file_id: 0,
+                    offset: 0,
+                }
+        }
+        (0, Some(_)) | (_, None) => false,
+        (_, Some(end)) => end == writer.position(),
+    };
+    if writer.database_uuid() == [0; 16] || !valid_logical_frontier || !valid_vlog_frontier {
         return Err(initial_state_error());
     }
     Ok(())
@@ -394,6 +491,7 @@ fn initial_state_error() -> StorageError {
 fn frontier_for(seq: CommitSeq, end: VLogPosition) -> DurableFrontier {
     DurableFrontier {
         durable_seq: seq,
+        durable_vlog_seq: seq,
         durable_vlog_end: DurableVLogEnd::Position(VLogPos {
             file_id: end.file_id,
             offset: end.offset,
@@ -401,15 +499,28 @@ fn frontier_for(seq: CommitSeq, end: VLogPosition) -> DurableFrontier {
     }
 }
 
-fn frontier_from_optional(seq: CommitSeq, end: Option<VLogPosition>) -> DurableFrontier {
-    match (seq, end) {
+fn frontier_from_optional(
+    seq: CommitSeq,
+    vlog_seq: CommitSeq,
+    end: Option<VLogPosition>,
+) -> DurableFrontier {
+    match (vlog_seq, end) {
         (0, None) => DurableFrontier {
-            durable_seq: 0,
+            durable_seq: seq,
+            durable_vlog_seq: 0,
             durable_vlog_end: DurableVLogEnd::Empty,
         },
-        (_, Some(end)) => frontier_for(seq, end),
+        (_, Some(end)) => DurableFrontier {
+            durable_seq: seq,
+            durable_vlog_seq: vlog_seq,
+            durable_vlog_end: DurableVLogEnd::Position(VLogPos {
+                file_id: end.file_id,
+                offset: end.offset,
+            }),
+        },
         _ => DurableFrontier {
             durable_seq: seq,
+            durable_vlog_seq: vlog_seq,
             durable_vlog_end: DurableVLogEnd::Empty,
         },
     }
@@ -429,6 +540,8 @@ fn snapshot(state: CommitState) -> CommitStateSnapshot {
     CommitStateSnapshot {
         head_seq: state.head_seq,
         durable_seq: state.durable_frontier.durable_seq,
+        head_vlog_seq: state.head_vlog_seq,
+        durable_vlog_seq: state.durable_frontier.durable_vlog_seq,
         head_vlog_end: state.head_vlog_end,
         durable_vlog_end: descriptor_end_to_format(state.durable_frontier.durable_vlog_end),
     }

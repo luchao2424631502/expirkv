@@ -65,9 +65,9 @@ struct FakeIndex {
 
 impl FakeIndex {
     fn with_durable_seq(durable_seq: u64) -> Self {
-        let backend = Self::default();
-        let frontier = DurableFrontier {
+        Self::with_frontier(DurableFrontier {
             durable_seq,
+            durable_vlog_seq: durable_seq,
             durable_vlog_end: if durable_seq == 0 {
                 DurableVLogEnd::Empty
             } else {
@@ -76,14 +76,17 @@ impl FakeIndex {
                     offset: 64,
                 })
             },
-        }
-        .encode()
-        .expect("frontier encodes");
+        })
+    }
+
+    fn with_frontier(frontier: DurableFrontier) -> Self {
+        let backend = Self::default();
+        let encoded = frontier.encode().expect("frontier encodes");
         backend
             .system
             .lock()
             .unwrap()
-            .insert(DURABLE_FRONTIER_KEY.to_vec(), frontier.to_vec());
+            .insert(DURABLE_FRONTIER_KEY.to_vec(), encoded.to_vec());
         backend
     }
 
@@ -274,6 +277,37 @@ fn cleanup_captures_the_persisted_frontier_and_deletes_meta_last() {
     assert_eq!(
         deleted_keys(&commits[3]),
         vec![encode_tx_meta_key(2).unwrap()]
+    );
+}
+
+#[test]
+fn cleanup_uses_logical_durable_seq_when_the_vlog_frontier_is_empty() {
+    let backend = FakeIndex::with_frontier(DurableFrontier {
+        durable_seq: 2,
+        durable_vlog_seq: 0,
+        durable_vlog_end: DurableVLogEnd::Empty,
+    });
+    backend.insert_descriptor(1, 1);
+    backend.insert_descriptor(2, 2);
+    backend.insert_descriptor(3, 1);
+    let frontier_before = backend.frontier_bytes();
+
+    let progress = cleanup_descriptors_once(&backend, &AtomicBool::new(false)).unwrap();
+
+    assert_eq!(progress.captured_durable_seq, 2);
+    assert_eq!(progress.deleted_mutations, 3);
+    assert_eq!(progress.deleted_meta, 2);
+    assert!(!backend.contains_descriptor(1));
+    assert!(!backend.contains_descriptor(2));
+    assert!(backend.contains_descriptor(3));
+    assert_eq!(backend.frontier_bytes(), frontier_before);
+    assert!(
+        backend
+            .successful_commits
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(mode, _)| *mode == IndexCommitMode::Buffer)
     );
 }
 

@@ -17,8 +17,8 @@ use crate::vlog::format::{
 use crate::{InstanceState, Operation, Result, RetryAdvice, StorageError, StorageErrorKind};
 
 use super::descriptor::{
-    CommitSeq, TransactionDescriptor, TxMeta, TxMutation, TxUuid, VLogPos, ValueState,
-    encode_descriptor, encode_head_seq, next_commit_seq,
+    CommitSeq, TransactionDescriptor, TransactionKind, TxMeta, TxMutation, TxUuid, VLogPos,
+    ValueState, encode_descriptor, encode_head_seq, next_commit_seq,
 };
 
 const MAX_KEY_VALUE_SIZE: usize = 60_000;
@@ -61,15 +61,27 @@ impl ValidatedWrite<'_> {
     pub(crate) fn public_operation(&self) -> Operation {
         self.public_operation
     }
+
+    pub(crate) fn transaction_kind(&self) -> TransactionKind {
+        if self
+            .normalized
+            .operations
+            .iter()
+            .any(|operation| matches!(operation, NormalizedOperation::Put { .. }))
+        {
+            TransactionKind::VLogEnvelope
+        } else {
+            TransactionKind::IndexOnlyDelete
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PreparedCommit {
     pub(crate) commit_seq: CommitSeq,
     pub(crate) tx_uuid: TxUuid,
-    pub(crate) vlog_begin: VLogPos,
-    pub(crate) vlog_end: VLogPos,
-    pub(crate) envelope: PreparedEnvelope,
+    pub(crate) transaction_kind: TransactionKind,
+    pub(crate) envelope: Option<PreparedEnvelope>,
     pub(crate) index_batch: IndexAtomicBatch,
     pub(crate) sync: bool,
 }
@@ -243,10 +255,8 @@ fn validate_normalized<'a>(
 
 pub(crate) fn prepare_commit<B, U>(
     write: &ValidatedWrite<'_>,
-    database_uuid: [u8; 16],
     head_seq: CommitSeq,
-    append_cursor: VLogPosition,
-    geometry: VLogGeometry,
+    vlog_context: Option<([u8; 16], VLogPosition, VLogGeometry)>,
     index: &B,
     uuid_source: &mut U,
 ) -> Result<PreparedCommit>
@@ -254,9 +264,6 @@ where
     B: IndexBackend,
     U: TxUuidSource,
 {
-    if database_uuid == [0; 16] {
-        return Err(invalid_argument(write.public_operation));
-    }
     let commit_seq = next_commit_seq(head_seq)
         .map_err(|_| permanent_capacity_exceeded(write.public_operation))?;
 
@@ -279,28 +286,72 @@ where
     }
 
     let tx_uuid = allocate_tx_uuid(uuid_source, write.public_operation)?;
-    let logical_operations = logical_operations(write)?;
-    let mut planner = LayoutPlanner::from_position(geometry, append_cursor)
-        .map_err(|error| remap_preflight(error, write.public_operation))?;
-    let envelope = crate::vlog::format::prepare_envelope(
-        &mut planner,
-        database_uuid,
-        commit_seq,
-        tx_uuid.0,
-        &logical_operations,
-    )
-    .map_err(|error| remap_preflight(error, write.public_operation))?;
+    let transaction_kind = write.transaction_kind();
+    let envelope = match transaction_kind {
+        TransactionKind::VLogEnvelope => {
+            let (database_uuid, append_cursor, geometry) =
+                vlog_context.ok_or_else(|| invalid_argument(write.public_operation))?;
+            if database_uuid == [0; 16] {
+                return Err(invalid_argument(write.public_operation));
+            }
+            let logical_operations = logical_operations(write)?;
+            #[cfg(test)]
+            crate::vlog::format::record_commit_layout_plan_call_for_test();
+            let mut planner = LayoutPlanner::from_position(geometry, append_cursor)
+                .map_err(|error| remap_preflight(error, write.public_operation))?;
+            Some(
+                crate::vlog::format::prepare_envelope(
+                    &mut planner,
+                    database_uuid,
+                    commit_seq,
+                    tx_uuid.0,
+                    &logical_operations,
+                )
+                .map_err(|error| remap_preflight(error, write.public_operation))?,
+            )
+        }
+        TransactionKind::IndexOnlyDelete => {
+            if vlog_context.is_some() {
+                return Err(invalid_argument(write.public_operation));
+            }
+            None
+        }
+    };
 
-    let key_plans = build_key_plans(write, &before_states, &envelope.value_pointers)?;
+    let key_plans = build_key_plans(
+        write,
+        &before_states,
+        transaction_kind,
+        envelope
+            .as_ref()
+            .map(|envelope| envelope.value_pointers.as_slice()),
+    )?;
     let logical_op_count = u64::try_from(write.normalized.operations.len())
         .map_err(|_| capacity_exceeded(write.public_operation))?;
     let distinct_key_count =
         u64::try_from(key_plans.len()).map_err(|_| capacity_exceeded(write.public_operation))?;
-    let vlog_begin = to_descriptor_position(envelope.vlog_begin);
-    let vlog_end = to_descriptor_position(envelope.vlog_end);
+    let (vlog_begin, vlog_end, envelope_crc32c) = match &envelope {
+        Some(envelope) => (
+            to_descriptor_position(envelope.vlog_begin),
+            to_descriptor_position(envelope.vlog_end),
+            envelope.envelope_crc32c,
+        ),
+        None => (
+            VLogPos {
+                file_id: 0,
+                offset: 0,
+            },
+            VLogPos {
+                file_id: 0,
+                offset: 0,
+            },
+            0,
+        ),
+    };
     let mutations = descriptor_mutations(&key_plans, write.public_operation)?;
     let descriptor = TransactionDescriptor {
         meta: TxMeta {
+            transaction_kind,
             commit_seq,
             tx_uuid,
             prev_seq: head_seq,
@@ -308,7 +359,7 @@ where
             vlog_end,
             logical_op_count,
             distinct_key_count,
-            envelope_crc32c: envelope.envelope_crc32c,
+            envelope_crc32c,
             descriptor_crc32c: 0,
         },
         mutations,
@@ -325,8 +376,7 @@ where
     Ok(PreparedCommit {
         commit_seq,
         tx_uuid,
-        vlog_begin,
-        vlog_end,
+        transaction_kind,
         envelope,
         index_batch,
         sync: write.normalized.sync,
@@ -343,13 +393,19 @@ struct KeyPlan {
 fn build_key_plans(
     write: &ValidatedWrite<'_>,
     before_states: &[ValueState],
-    value_pointers: &[Option<ValuePointer>],
+    transaction_kind: TransactionKind,
+    value_pointers: Option<&[Option<ValuePointer>]>,
 ) -> Result<Vec<KeyPlan>> {
     if before_states.len() != write.distinct_keys.len()
-        || value_pointers.len() != write.normalized.operations.len()
         || write.operation_ordinals.len() != write.normalized.operations.len()
     {
         return Err(invalid_argument(write.public_operation));
+    }
+    match (transaction_kind, value_pointers) {
+        (TransactionKind::VLogEnvelope, Some(pointers))
+            if pointers.len() == write.normalized.operations.len() => {}
+        (TransactionKind::IndexOnlyDelete, None) => {}
+        _ => return Err(invalid_argument(write.public_operation)),
     }
     let mut plans = try_vec_with_capacity(
         write.distinct_keys.len(),
@@ -372,20 +428,35 @@ fn build_key_plans(
         });
     }
 
-    for ((operation, ordinal), pointer) in write
+    for (operation_index, (operation, ordinal)) in write
         .normalized
         .operations
         .iter()
         .zip(&write.operation_ordinals)
-        .zip(value_pointers)
+        .enumerate()
     {
         let plan = plans
             .get_mut(*ordinal)
             .ok_or_else(|| invalid_argument(write.public_operation))?;
-        plan.after_state = match (operation, pointer) {
-            (NormalizedOperation::Put { .. }, Some(pointer)) => ValueState::Present(*pointer),
-            (NormalizedOperation::Delete { .. }, None) => ValueState::Absent,
-            _ => return Err(invalid_argument(write.public_operation)),
+        plan.after_state = match transaction_kind {
+            TransactionKind::VLogEnvelope => {
+                let pointer = value_pointers
+                    .and_then(|pointers| pointers.get(operation_index))
+                    .ok_or_else(|| invalid_argument(write.public_operation))?;
+                match (operation, pointer) {
+                    (NormalizedOperation::Put { .. }, Some(pointer)) => {
+                        ValueState::Present(*pointer)
+                    }
+                    (NormalizedOperation::Delete { .. }, None) => ValueState::Absent,
+                    _ => return Err(invalid_argument(write.public_operation)),
+                }
+            }
+            TransactionKind::IndexOnlyDelete => match operation {
+                NormalizedOperation::Delete { .. } => ValueState::Absent,
+                NormalizedOperation::Put { .. } => {
+                    return Err(invalid_argument(write.public_operation));
+                }
+            },
         };
     }
     Ok(plans)
